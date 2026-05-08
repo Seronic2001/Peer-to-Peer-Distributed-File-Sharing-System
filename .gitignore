@@ -1,0 +1,21 @@
+#Build Folder
+build/
+
+#Executables
+tracker/tracker
+client/client
+
+#Testing Payloads
+*.bat
+*.bin
+*.zip
+*.dat
+*.tex
+
+#Local file
+tracker_info.txt
+
+#Editor Specific
+.vscode/
+*.swp
+*~

@@ -77,7 +77,7 @@ bool parse_tracker_info(const std::string& file_path,
       continue;
     size_t colon_pos = line.find(':');
     if (colon_pos == std::string::npos) {
-      log_tracker("Error: Invalid format in tracker_info.txt: ", line);
+      log_tracker_err("Invalid format in tracker_info.txt: ", line);
       return false;
     }
     TrackerInfo info;
@@ -116,18 +116,20 @@ void handle_client(int client_sock, ReplicationManager& replication_manager) {
   } else {
     sendMessage(client_sock, "ROLE BACKUP");
     close(client_sock);
-    log_tracker("[Client Thread] Refused connection from socket ", client_sock,
-                " (I am a backup)");
+    log_tracker_debug("[Client Thread] Refused connection from socket ",
+                      client_sock, " (I am a backup)");
     return;
   }
-  log_tracker("[Client Thread] New client connected on socket ", client_sock);
+  log_tracker_debug("[Client Thread] New client connected on socket ",
+                    client_sock);
 
   std::string current_user_id;
   bool client_is_logged_in = false;
 
   std::string message;
   while (receiveMessage(client_sock, message)) {
-    log_tracker("[Client Thread] Received from ", client_sock, ": ", message);
+    log_tracker_debug("[Client Thread] Received from ", client_sock, ": ",
+                      message);
 
     std::stringstream ss(message);
     std::vector<std::string> tokens;
@@ -256,15 +258,15 @@ void handle_client(int client_sock, ReplicationManager& replication_manager) {
             file_size = std::stoll(tokens[3]);
           } catch (const std::exception&) {
             response = "ERROR: File size must be an integer.";
-            log_tracker("[Client Thread] Sending response to ", client_sock,
-                        ": ", response);
+            log_tracker_debug("[Client Thread] Sending response to ",
+                              client_sock, ": ", response);
             sendMessage(client_sock, response);
             continue;
           }
           if (file_size < 0) {
             response = "ERROR: File size must be non-negative.";
-            log_tracker("[Client Thread] Sending response to ", client_sock,
-                        ": ", response);
+            log_tracker_debug("[Client Thread] Sending response to ",
+                              client_sock, ": ", response);
             sendMessage(client_sock, response);
             continue;
           }
@@ -345,8 +347,8 @@ void handle_client(int client_sock, ReplicationManager& replication_manager) {
       }
     }
 
-    log_tracker("[Client Thread] Sending response to ", client_sock, ": ",
-                response);
+    log_tracker_debug("[Client Thread] Sending response to ", client_sock,
+                      ": ", response);
     sendMessage(client_sock, response);
   }
 
@@ -380,8 +382,8 @@ int main(int argc, char const* argv[]) {
 
   // Enforce single instance per tracker ID
   if (!acquire_tracker_lock(tracker_no)) {
-    log_tracker("[Error] Another instance of tracker ", tracker_no,
-                " is already running.");
+    log_tracker_err("Another instance of tracker ", tracker_no,
+                    " is already running.");
     return 1;
   }
   atexit(release_tracker_lock);
@@ -424,7 +426,7 @@ int main(int argc, char const* argv[]) {
       log_tracker("[Error] Client port ", my_info.port,
                   " is already in use. Is another tracker instance running?");
     } else {
-      log_tracker("[Error] Bind failed for client port: ", strerror(errno));
+      log_tracker_err("Bind failed for client port: ", strerror(errno));
     }
     exit(EXIT_FAILURE);
   }
@@ -433,7 +435,7 @@ int main(int argc, char const* argv[]) {
 
   log_tracker("Tracker ", tracker_no, " setup on port ", my_info.port,
               ". Waiting for role...");
-  log_tracker("Type 'quit' and press Enter to shut down.");
+  log_tracker_warn("Type 'quit' and press Enter to shut down.");
 
   while (!should_exit) {
     if (replication_manager.is_primary_()) {

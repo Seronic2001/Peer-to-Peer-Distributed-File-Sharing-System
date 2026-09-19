@@ -1,11 +1,15 @@
 #Build Folder
 build/
+build_release/
+
 tests/build/
 tests/build_san/
 
 #Executables
 tracker/tracker
 client/client
+tracker/tracker-release
+client/client-release
 
 #Testing Payloads
 *.bat

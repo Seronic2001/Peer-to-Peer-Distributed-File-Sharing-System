@@ -34,6 +34,9 @@ class ReplicationManager {
 
   int self_id;
   TrackerState& state;
+  // Copy of the tracker list: run() needs the size to decide whether an
+  // election peer even exists (single-tracker deployments must not probe).
+  std::vector<TrackerInfo> trackers_ref;
   TrackerInfo self_info;
   TrackerInfo other_tracker_info;
 

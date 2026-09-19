@@ -34,12 +34,20 @@ std::unordered_map<std::string, std::shared_ptr<DownloadState>> g_downloads;
 std::mutex g_downloads_mutex;
 std::atomic<bool> exit_program(false);
 std::atomic_bool is_logged_in(false);  // Client-side authentication state
+// The authenticated user's id. Logically session-global: the prompt builder
+// (which runs on the main thread) and login/logout handlers all use it.
+std::string current_user_id = "";
 
 // State for Raw Mode Line Editor
 std::string current_line;
 size_t cursor_pos = 0;
 std::mutex cout_mutex;
 struct termios orig_termios;
+
+// Command history for Up/Down arrow navigation.
+static std::vector<std::string> input_history;
+static size_t history_nav = 0;        // Current position while navigating.
+static std::string nav_snapshot;      // Line being typed when nav started.
 
 std::string get_application_home() {
   // This function points to a specific, hardcoded directory.
@@ -79,10 +87,68 @@ void enable_raw_mode() {
   tcsetattr(STDIN_FILENO, TCSAFLUSH, &raw);
 }
 
+// Builds the dynamic colored prompt: green user when logged in, dim red
+// "anonymous" otherwise. The caller must hold cout_mutex.
+std::string build_prompt() {
+  if (is_logged_in.load() && !current_user_id.empty()) {
+    return ui::bold_color(ui::GREEN, current_user_id) +
+           ui::styled(ui::DIM, "@p2p") +
+           ui::bold_color(ui::CYAN, " >> ");
+  }
+  return ui::styled(ui::DIM, "anon") + ui::styled(ui::DIM, "@p2p") +
+         ui::bold_color(ui::CYAN, " >> ");
+}
+
 void redraw_line() {
-  const std::string prompt = ">> ";
+  // Prompt is recomputed every redraw so a login/logout instantly recolors
+  // it. ui::visible_len() counts only visible characters, so ANSI color
+  // codes never skew the cursor arithmetic.
+  const std::string prompt = build_prompt();
+  const size_t prompt_width = ui::visible_len(prompt);
   std::cout << "\r\x1b[K" << prompt << current_line;
-  std::cout << "\r\x1b[" << (prompt.length() + cursor_pos) << "C" << std::flush;
+  std::cout << "\r\x1b[" << (prompt_width + cursor_pos) << "C" << std::flush;
+}
+
+// Prints a tracker response with semantics-aware coloring: SUCCESS green,
+// ERROR red, anything else cyan.
+void log_tracker_response(const std::string& response) {
+  if (response.rfind("SUCCESS", 0) == 0) {
+    log_message(ui::bold_color(ui::GREEN, "[Tracker]"), " ",
+                ui::styled(ui::GREEN, response));
+  } else if (response.rfind("ERROR", 0) == 0) {
+    log_error(ui::bold_color(ui::RED, "[Tracker]"), " ",
+              ui::styled(ui::RED, response));
+  } else {
+    log_message(ui::bold_color(ui::CYAN, "[Tracker]"), " ", response);
+  }
+}
+
+// Local 'help' output. Never touches the network.
+void print_help() {
+  const auto cmd = [](const std::string& name, const std::string& args,
+                      const std::string& desc) {
+    log_message("  ", ui::bold_color(ui::GREEN, name), " ",
+                ui::styled(ui::DIM, args), desc);
+  };
+  log_message(ui::bold_color(ui::MAGENTA, "Commands:"));
+  cmd("create_user", "<user_id> <password>", "  register");
+  cmd("login", "<user_id> <password>", "            authenticate");
+  cmd("logout", "", "                        end session");
+  cmd("create_group", "<group_id>", "             new group (owner = you)");
+  cmd("join_group", "<group_id>", "              request to join");
+  cmd("leave_group", "<group_id>", "             leave a group");
+  cmd("accept_request", "<group_id> <user_id>", "approve a join request");
+  cmd("list_groups", "", "                   groups you can see");
+  cmd("list_requests", "<group_id>", "          pending join requests");
+  cmd("list_files", "<group_id>", "             files shared in a group");
+  cmd("upload_file", "<group_id> <file_path>", "  share a file");
+  cmd("download_file", "<group> <file> <dest> [alg]", "alg: rarest|sequential|random");
+  cmd("stop_share", "<group_id> <file_name>", "  stop seeding");
+  cmd("show_downloads", "", "                active/finished downloads");
+  cmd("quit", "", "                           exit the client");
+  log_message(ui::styled(ui::DIM,
+                         "Keys: Up/Down history · Left/Right move · Home/End · "
+                         "Ctrl+U clear · Ctrl+W delete word"));
 }
 
 // Helper to check connection health
@@ -153,7 +219,7 @@ void save_metadata_file(const std::string& user_id,
   // O_TRUNC will clear the file if it exists, ensuring we write fresh data.
   int fd = open(meta_path.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0666);
   if (fd < 0) {
-    log_message("[Error] Could not open .meta file for writing: ", meta_path);
+    log_error("Could not open .meta file for writing: ", meta_path);
     return;
   }
 
@@ -220,7 +286,7 @@ void load_state_from_disk(const std::string& user_id) {
     }
   }
   closedir(dir);
-  log_message("[State] Loaded ", seeded_files.size(),
+  log_debug("[State] Loaded ", seeded_files.size(),
               " seeded files from disk for user ", user_id);
 }
 
@@ -240,18 +306,27 @@ int main(int argc, char const* argv[]) {
 
   size_t colon_pos_self = self_addr_str.find(':');
   if (colon_pos_self == std::string::npos) {
-    log_message("Invalid listening address format. Use IP:PORT");
+    log_error("Invalid listening address format. Use IP:PORT");
     return 1;
   }
   self_ip = self_addr_str.substr(0, colon_pos_self);
   self_port_str = self_addr_str.substr(colon_pos_self + 1);
-  self_port = std::stoi(self_port_str);
+  try {
+    self_port = std::stoi(self_port_str);
+  } catch (const std::exception&) {
+    log_error("Invalid port number: '", self_port_str, "'");
+    return 1;
+  }
+  if (self_port <= 0 || self_port > 65535) {
+    log_error("Port out of range (1-65535): ", self_port);
+    return 1;
+  }
 
   // Read tracker addresses from tracker_info.txt
   std::vector<std::string> tracker_addresses;
   int fd = open(tracker_info_path.c_str(), O_RDONLY);
   if (fd < 0) {
-    log_message("Error: Could not open tracker info file: ", tracker_info_path);
+    log_error("Could not open tracker info file: ", tracker_info_path);
     return 1;
   }
   char buffer[1024];  // Assume tracker info file is reasonably small
@@ -270,7 +345,7 @@ int main(int argc, char const* argv[]) {
   }
 
   if (tracker_addresses.empty()) {
-    log_message("Error: No tracker addresses found in ", tracker_info_path);
+    log_error("No tracker addresses found in ", tracker_info_path);
     return 1;
   }
 
@@ -305,7 +380,14 @@ int main(int argc, char const* argv[]) {
     if (colon_pos == std::string::npos)
       continue;
     std::string tracker_ip = addr.substr(0, colon_pos);
-    int tracker_port = std::stoi(addr.substr(colon_pos + 1));
+    int tracker_port = 0;
+    try {
+      tracker_port = std::stoi(addr.substr(colon_pos + 1));
+    } catch (const std::exception&) {
+      log_warn("Skipping malformed tracker address: ", addr);
+      close(sockfd);
+      continue;
+    }
 
     struct sockaddr_in serv_addr;
     serv_addr.sin_family = AF_INET;
@@ -334,7 +416,7 @@ int main(int argc, char const* argv[]) {
   }
 
   if (!connected_to_tracker) {
-    log_message("Error: Failed to connect to any available tracker.");
+    log_error("Failed to connect to any available tracker.");
     return 1;
   }
 
@@ -357,7 +439,7 @@ int main(int argc, char const* argv[]) {
   setsockopt(peer_server_fd, SOL_SOCKET, SO_REUSEADDR, &peer_opt,
              sizeof(peer_opt));
   if (inet_pton(AF_INET, self_ip.c_str(), &peer_addr.sin_addr) <= 0) {
-    log_message("Invalid listening IP address provided.");
+    log_error("Invalid listening IP address provided.");
     close(peer_server_fd);
     return 1;
   }
@@ -365,18 +447,33 @@ int main(int argc, char const* argv[]) {
   if (bind(peer_server_fd, (struct sockaddr*)&peer_addr, sizeof(peer_addr)) <
       0) {
     perror("bind (peer server) failed");
-    log_message("Error: Could not bind to ", self_addr_str,
-                ". Is the port already in use?");
+    log_error("Could not bind to ", self_addr_str,
+              ". Is the port already in use?");
     return 1;
   }
 
   bool is_peer_server_running = false;
 
-  std::string current_user_id = "";
-
   // Main Input Loop
   enable_raw_mode();
-  log_message("Type 'quit' or 'exit' to stop.");
+  {
+    std::lock_guard<std::mutex> lock(cout_mutex);
+    std::cout << "\n"
+              << ui::bold_color(ui::MAGENTA,
+                                "  ╔══════════════════════════════════════╗")
+              << "\n"
+              << ui::bold_color(ui::MAGENTA,
+                                "  ║  P2P  Distributed  File  Sharing     ║")
+              << "\n"
+              << ui::bold_color(ui::MAGENTA,
+                                "  ╚══════════════════════════════════════╝")
+              << "\n\n"
+              << ui::styled(ui::DIM,
+                            "  Type 'help' for commands, 'quit' to stop.")
+              << "\n\n";
+    redraw_line();
+    std::cout << std::flush;
+  }
 
   bool safe_exit = false;
 
@@ -413,7 +510,7 @@ int main(int argc, char const* argv[]) {
             // Send the command using the main thread's safe socket.
             std::string response;
             if (safe_send(sockfd, upload_cmd) && safe_recv(sockfd, response)) {
-              log_message("[Tracker]: ", response);
+              log_tracker_response(response);
               if (response.rfind("SUCCESS", 0) == 0) {
                 // Update local state now that the tracker has confirmed.
                 std::lock_guard<std::mutex> seed_lock(seeded_files_mutex);
@@ -473,12 +570,27 @@ int main(int argc, char const* argv[]) {
         current_line.clear();
         cursor_pos = 0;
 
-        log_message(">> ", command_to_process);
+        // Remember the command in history (skip empty lines and exact
+        // consecutive duplicates, like bash).
+        if (!command_to_process.empty() &&
+            (input_history.empty() ||
+             input_history.back() != command_to_process)) {
+          input_history.push_back(command_to_process);
+          if (input_history.size() > 200) input_history.erase(input_history.begin());
+        }
+        history_nav = input_history.size();
+
+        log_message(ui::styled(ui::DIM, "ran: "), command_to_process);
 
         if (command_to_process == "quit" || command_to_process == "exit") {
           exit_program = true;
           safe_exit = true;
           break;
+        }
+
+        if (command_to_process == "help" || command_to_process == "?") {
+          print_help();
+          continue;
         }
 
         if (!command_to_process.empty()) {
@@ -488,14 +600,27 @@ int main(int argc, char const* argv[]) {
           while (ss >> token) {
             tokens.push_back(token);
           }
+          if (tokens.empty()) continue;  // Whitespace-only input.
           std::string command = tokens[0];
           bool should_send = true;
           std::string response;
 
+          // Guard every per-command token access below: a malformed command
+          // must print usage, never crash the CLI or skip state updates.
+          auto has_args = [&](size_t n) {
+            if (tokens.size() < n) {
+              log_warn("Usage: ", command, " is missing arguments (expected ",
+                       n - 1, "). Type 'help' for command list.");
+              should_send = false;
+              return false;
+            }
+            return true;
+          };
+
           // Argument and Authentication Pre-Checks
           if (command != "create_user" && command != "login") {
             if (!is_logged_in.load()) {
-              log_message("Error: You must be logged in to use this command.");
+              log_error("You must be logged in to use this command.");
               should_send = false;
             }
           }
@@ -504,7 +629,11 @@ int main(int argc, char const* argv[]) {
             command_to_process += " " + self_port_str;
           } else if (command == "upload_file") {
             should_send = false;  // Handled specially
-            if (is_logged_in && tokens.size() == 3) {
+            if (!is_logged_in.load()) {
+              log_error("You must be logged in to upload a file.");
+            } else if (!has_args(3)) {
+              // Usage hint already printed by has_args.
+            } else {
               std::string group_id = tokens[1];
               std::string user_provided_path = tokens[2];
 
@@ -519,7 +648,7 @@ int main(int argc, char const* argv[]) {
               // storage.
               char resolved_path[PATH_MAX];
               if (realpath(user_provided_path.c_str(), resolved_path) == NULL) {
-                log_message("Error: Cannot find or resolve file path: ",
+                log_error("Cannot find or resolve file path: ",
                             user_provided_path);
                 continue;
               }
@@ -539,7 +668,7 @@ int main(int argc, char const* argv[]) {
                   continue;
                 if (!safe_recv(sockfd, response))
                   continue;
-                log_message("[Tracker]: ", response);
+                log_tracker_response(response);
                 if (response.rfind("SUCCESS", 0) == 0) {
                   std::lock_guard<std::mutex> lock(seeded_files_mutex);
                   seeded_files[logical_name] = {absolute_path,
@@ -550,11 +679,9 @@ int main(int argc, char const* argv[]) {
                                      absolute_path, hashes.file_size,
                                      hashes.concatenated_hashes);
                 }
-              } catch (const std::runtime_error& e) {
-                log_message("Error: ", e.what());
+              } catch (const std::exception& e) {
+                log_error("Hashing failed: ", e.what());
               }
-            } else if (!is_logged_in.load()) {
-              log_message("Error: You must be logged in to upload a file.");
             }
           } else if (command == "show_downloads") {
             should_send = false;
@@ -582,11 +709,11 @@ int main(int argc, char const* argv[]) {
           } else if (command == "download_file") {
             should_send = false;
             if (!is_logged_in.load()) {
-              log_message("Error: You must be logged in to download a file.");
+              log_error("You must be logged in to download a file.");
             } else if (tokens.size() != 4 && tokens.size() != 5) {
-              log_message(
-                  "Usage: download_file <group_id> <file_name> "
-                  "<destination_path> optional : [algorithm]");
+              log_warn(
+                    "Usage: download_file <group_id> <file_name> "
+                    "<destination_path> [algorithm]");
             } else {
               std::string tracker_command =
                   tokens[0] + " " + tokens[1] + " " + tokens[2];
@@ -634,9 +761,7 @@ int main(int argc, char const* argv[]) {
                 }
 
                 if (!parse_ok) {
-                  log_message("Error: Malformed download response from "
-                              "tracker: ",
-                              response);
+                  log_error("Malformed download response from tracker: ", response);
                   continue;
                 }
 
@@ -647,7 +772,7 @@ int main(int argc, char const* argv[]) {
                   peers_list.push_back(peer_addr);
                 }
                 if (peers_list.empty()) {
-                  log_message("No seeders found for this file.");
+                  log_warn("No seeders found for this file.");
                 } else {
                   std::string group_id = tokens[1];
                   std::string file_name = tokens[2];
@@ -663,8 +788,8 @@ int main(int argc, char const* argv[]) {
                     auto existing = g_downloads.find(file_name);
                     if (existing != g_downloads.end() &&
                         !existing->second->download_complete.load()) {
-                      log_message("Error: A download of '", file_name,
-                                  "' is already in progress on this client.");
+                      log_error("A download of '", file_name,
+                        "' is already in progress on this client.");
                       continue;
                     }
                   }
@@ -694,11 +819,11 @@ int main(int argc, char const* argv[]) {
                   // risk an out-of-bounds piece index later.
                   if (state->piece_hashes.size() !=
                       static_cast<size_t>(state->num_pieces)) {
-                    log_message(
-                        "Error: Hash count mismatch for ", file_name, " (",
-                        state->piece_hashes.size(), " hashes for ",
-                        state->num_pieces, " pieces). Tracker metadata is "
-                        "corrupt; aborting download.");
+                    log_error(
+                      "Hash count mismatch for ", file_name, " (",
+                      state->piece_hashes.size(), " hashes for ",
+                      state->num_pieces,
+                      " pieces). Tracker metadata is corrupt; aborting.");
                     continue;
                   }
 
@@ -729,7 +854,7 @@ int main(int argc, char const* argv[]) {
 
                   std::string start_leeching_response;
                   if (safe_recv(sockfd, start_leeching_response)) {
-                    log_message("[Tracker] ", start_leeching_response);
+                    log_tracker_response(start_leeching_response);
                   }
 
                   std::thread download_thread(start_download, state);
@@ -737,7 +862,7 @@ int main(int argc, char const* argv[]) {
                 }
               } else {
                 // The command failed, just log the tracker's error message.
-                log_message("[Tracker]: ", response);
+                log_tracker_response(response);
               }
             }
           }
@@ -748,9 +873,12 @@ int main(int argc, char const* argv[]) {
               continue;
             if (!safe_recv(sockfd, response))
               continue;
-            log_message("[Tracker]: ", response);
+            log_tracker_response(response);
 
             if (command == "login" && response.rfind("SUCCESS", 0) == 0) {
+              if (!has_args(2)) {
+                continue;  // Tracker accepted but our usage is wrong.
+              }
               is_logged_in.store(true);
               current_user_id = tokens[1];
 
@@ -776,9 +904,12 @@ int main(int argc, char const* argv[]) {
               is_logged_in.store(false);
               std::lock_guard<std::mutex> lock(seeded_files_mutex);
               seeded_files.clear();
-              log_message("[Seeder Sync] Cleared seeded file state on logout");
+              log_debug("[Seeder Sync] Cleared seeded file state on logout");
             } else if (command == "stop_share" &&
                        response.rfind("SUCCESS", 0) == 0) {
+              if (!has_args(3)) {
+                continue;
+              }
               std::string group_id = tokens[1];
               std::string file_name_to_stop = tokens[2];
               std::string app_home = get_application_home();
@@ -787,10 +918,10 @@ int main(int argc, char const* argv[]) {
                                              current_user_id + "/" + group_id +
                                              "_" + file_name_to_stop + ".meta";
                 if (std::remove(meta_file_path.c_str()) != 0) {
-                  log_message("[Error] Could not delete metadata file: ",
+                  log_error("Could not delete metadata file: ",
                               meta_file_path);
                 } else {
-                  log_message("[State] Deleted metadata for ",
+                  log_debug("[State] Deleted metadata for ",
                               file_name_to_stop);
                 }
               }
@@ -809,11 +940,116 @@ int main(int argc, char const* argv[]) {
           std::lock_guard<std::mutex> lock(cout_mutex);
           redraw_line();
         }
+      } else if (c == 27) {  // ESC: escape sequence (arrows, Home/End, Del)
+        char seq[2];
+        if (read(STDIN_FILENO, &seq[0], 1) != 1) continue;
+        if (read(STDIN_FILENO, &seq[1], 1) != 1) continue;
+
+        if (seq[0] == '[') {
+          std::lock_guard<std::mutex> lock(cout_mutex);
+          if (seq[1] == 'A') {  // Up: older history entry.
+            if (!input_history.empty() && history_nav > 0) {
+              if (history_nav == input_history.size())
+                nav_snapshot = current_line;  // Remember in-progress line.
+              history_nav--;
+              current_line = input_history[history_nav];
+              cursor_pos = current_line.size();
+              redraw_line();
+            }
+          } else if (seq[1] == 'B') {  // Down: newer history entry.
+            if (history_nav < input_history.size()) {
+              history_nav++;
+              if (history_nav == input_history.size()) {
+                current_line = nav_snapshot;  // Restore in-progress line.
+              } else {
+                current_line = input_history[history_nav];
+              }
+              cursor_pos = current_line.size();
+              redraw_line();
+            }
+          } else if (seq[1] == 'C') {  // Right.
+            if (cursor_pos < current_line.size()) {
+              cursor_pos++;
+              redraw_line();
+            }
+          } else if (seq[1] == 'D') {  // Left.
+            if (cursor_pos > 0) {
+              cursor_pos--;
+              redraw_line();
+            }
+          } else if (seq[1] == 'H') {  // Home.
+            cursor_pos = 0;
+            redraw_line();
+          } else if (seq[1] == 'F') {  // End.
+            cursor_pos = current_line.size();
+            redraw_line();
+          } else if (seq[1] == '3') {  // Delete key: '3' + '~'.
+            char tilde;
+            if (read(STDIN_FILENO, &tilde, 1) == 1 && tilde == '~') {
+              if (cursor_pos < current_line.size()) {
+                current_line.erase(cursor_pos, 1);
+                redraw_line();
+              }
+            }
+          } else if (seq[1] == '1') {  // Home on some terminals: '1' + '~'.
+            char tilde;
+            if (read(STDIN_FILENO, &tilde, 1) == 1 && tilde == '~') {
+              cursor_pos = 0;
+              redraw_line();
+            }
+          } else if (seq[1] == '4') {  // End on some terminals: '4' + '~'.
+            char tilde;
+            if (read(STDIN_FILENO, &tilde, 1) == 1 && tilde == '~') {
+              cursor_pos = current_line.size();
+              redraw_line();
+            }
+          }
+        }
+        // Any other escape sequence: ignored (never crashes, never leaks
+        // bytes into the command line).
+      } else if (c == 1) {  // Ctrl+A: home.
+        cursor_pos = 0;
+        std::lock_guard<std::mutex> lock(cout_mutex);
+        redraw_line();
+      } else if (c == 5) {  // Ctrl+E: end.
+        cursor_pos = current_line.size();
+        std::lock_guard<std::mutex> lock(cout_mutex);
+        redraw_line();
+      } else if (c == 21) {  // Ctrl+U: clear whole line.
+        current_line.clear();
+        cursor_pos = 0;
+        std::lock_guard<std::mutex> lock(cout_mutex);
+        redraw_line();
+      } else if (c == 11) {  // Ctrl+K: kill to end of line.
+        current_line.erase(cursor_pos);
+        std::lock_guard<std::mutex> lock(cout_mutex);
+        redraw_line();
+      } else if (c == 23) {  // Ctrl+W: delete the word before the cursor.
+        size_t end = cursor_pos;
+        while (end > 0 && isspace((unsigned char)current_line[end - 1])) end--;
+        size_t start = end;
+        while (start > 0 && !isspace((unsigned char)current_line[start - 1]))
+          start--;
+        if (start < end) {
+          current_line.erase(start, end - start);
+          cursor_pos = start;
+        }
+        std::lock_guard<std::mutex> lock(cout_mutex);
+        redraw_line();
+      } else if (c == 12) {  // Ctrl+L: clear screen and repaint.
+        std::lock_guard<std::mutex> lock(cout_mutex);
+        std::cout << "\x1b[2J\x1b[H" << std::flush;
+        redraw_line();
       } else if (!iscntrl(c)) {
         current_line.insert(cursor_pos, 1, c);
         cursor_pos++;
         std::lock_guard<std::mutex> lock(cout_mutex);
         redraw_line();
+      } else {
+        // Any other control byte (Ctrl+C/Ctrl+D flow control, tab, etc.):
+        // swallowed here so it can neither crash the loop nor corrupt the
+        // line buffer.
+        continue;
       }
     }
   }

@@ -16,9 +16,15 @@
 ReplicationManager::ReplicationManager(int self_id,
                                        const std::vector<TrackerInfo>& trackers,
                                        TrackerState& state)
-    : self_id(self_id), state(state), should_stop(false) {
+    : self_id(self_id), state(state), trackers_ref(trackers),
+      should_stop(false) {
   self_info = trackers[self_id - 1];
-  other_tracker_info = trackers[self_id == 1 ? 1 : 0];
+  // With a single tracker there is no peer: index 1 would be OUT OF BOUNDS
+  // (previously crashed with bad_alloc on corrupt string assignment). Point
+  // other_tracker_info at ourselves as a placeholder; the election loop in
+  // run() checks trackers.size() and skips probing entirely in that case.
+  const size_t other_idx = (self_id == 1) ? 1 : 0;
+  other_tracker_info = trackers[trackers.size() > 1 ? other_idx : 0];
   is_primary = false;  // Start undecided, election will decide
 }
 
@@ -88,28 +94,34 @@ void ReplicationManager::run() {
     return;
   }
 
-  listen(listener_fd, 1);
-
-  while (!should_stop) {
-    // Try connecting to the other tracker first (for election)
-    int probe_sock = socket(AF_INET, SOCK_STREAM, 0);
-    struct sockaddr_in other_addr;
-    other_addr.sin_family = AF_INET;
-    other_addr.sin_port = htons(other_tracker_info.port + 1000);
-    inet_pton(AF_INET, other_tracker_info.ip.c_str(), &other_addr.sin_addr);
-    if (connect(probe_sock, (struct sockaddr*)&other_addr, sizeof(other_addr)) <
-        0) {
+  listen(listener_fd, 1);  while (!should_stop) {
+    if (trackers_ref.size() <= 1) {
+      // Single-tracker deployment: nobody to elect with, so become PRIMARY
+      // immediately. Probing would only connect back to our own listener.
       if (!is_primary) {
-        log_tracker("[Replication] No active primary found. Becoming PRIMARY.");
+        log_tracker("[Replication] Single tracker setup. Becoming PRIMARY.");
         is_primary = true;
       }
-      close(probe_sock);
     } else {
-      log_tracker("[Replication] Found active primary. Staying BACKUP.");
-      is_primary = false;
-      close(probe_sock);
+      // Try connecting to the other tracker first (for election)
+      int probe_sock = socket(AF_INET, SOCK_STREAM, 0);
+      struct sockaddr_in other_addr;
+      other_addr.sin_family = AF_INET;
+      other_addr.sin_port = htons(other_tracker_info.port + 1000);
+      inet_pton(AF_INET, other_tracker_info.ip.c_str(), &other_addr.sin_addr);
+      if (connect(probe_sock, (struct sockaddr*)&other_addr,
+                  sizeof(other_addr)) < 0) {
+        if (!is_primary) {
+          log_tracker("[Replication] No active primary found. Becoming PRIMARY.");
+          is_primary = true;
+        }
+        close(probe_sock);
+      } else {
+        log_tracker("[Replication] Found active primary. Staying BACKUP.");
+        is_primary = false;
+        close(probe_sock);
+      }
     }
-
     if (is_primary) {
       run_primary_mode(listener_fd);
     } else {

@@ -46,7 +46,7 @@ bool is_file_seeded(const std::string& file_name) {
 }
 
 void handle_peer_connection(int peer_sock) {
-  log_message("[Peer Thread] New peer connected on socket ", peer_sock);
+  log_debug("[Peer Thread] New peer connected on socket ", peer_sock);
 
   std::string handshake_message;
   if (!receiveMessage(peer_sock, handshake_message)) {
@@ -54,7 +54,7 @@ void handle_peer_connection(int peer_sock) {
     return;
   }
 
-  log_message("[Peer Thread] Received from peer: ", handshake_message);
+  log_debug("[Peer Thread] Received from peer: ", handshake_message);
 
   std::stringstream ss(handshake_message);
   std::string command, file_name;
@@ -123,19 +123,19 @@ void handle_peer_connection(int peer_sock) {
       for (bool have_piece : download_state->pieces_we_have) {
         bitfield_to_send += (have_piece ? '1' : '0');
       }
-      log_message("[Peer Thread] Sending PARTIAL bitfield for ", file_name);
+      log_debug("[Peer Thread] Sending PARTIAL bitfield for ", file_name);
     } else {
       // CASE 2: The file is not being downloaded, so it must be a fully seeded
       // file. Construct a bitfield of all '1's.
       bitfield_to_send = std::string(num_pieces, '1');
-      log_message("[Peer Thread] Sending FULL bitfield for ", file_name);
+      log_debug("[Peer Thread] Sending FULL bitfield for ", file_name);
     }
     // Now, send the correctly constructed bitfield to the peer.
     sendMessage(peer_sock, "BITFIELD " + bitfield_to_send);
   } catch (const std::exception& e) {
     // This block will now catch potential issues, like the file path missing
     // for a seeder.
-    log_message("[Peer Thread] Error during bitfield generation: ", e.what());
+    log_error("[Peer Thread] Error during bitfield generation: ", e.what());
     // It's best to close the connection if we can't send a valid bitfield.
     close(peer_sock);
     return;
@@ -163,7 +163,7 @@ void handle_peer_connection(int peer_sock) {
       }
       long long max_pieces = (file_size + PIECE_SIZE - 1) / PIECE_SIZE;
       if (piece_index < 0 || piece_index >= max_pieces) {
-        log_message("[Peer Thread] Rejecting out-of-range piece request ",
+        log_debug("[Peer Thread] Rejecting out-of-range piece request ",
                     piece_index, " for ", file_name);
         continue;
       }
@@ -193,7 +193,7 @@ void handle_peer_connection(int peer_sock) {
   }
 
   close(peer_sock);
-  log_message("[Peer Thread] Peer ", peer_sock, " disconnected.");
+  log_debug("[Peer Thread] Peer ", peer_sock, " disconnected.");
 }
 
 void run_peer_server_loop(int server_fd) {

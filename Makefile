@@ -2,7 +2,25 @@
 
 CXX = g++
 
-CXXFLAGS = -std=c++17 -Wall -Wextra -g
+# Base warning set shared by every build mode.
+WARNFLAGS = -Wall -Wextra
+
+# ---------------------------------------------------------------------------
+# Build modes
+#
+#   make            (debug, default) -g, P2P_LOG_LEVEL=LOG_DEBUG
+#                                     full protocol/peer chatter enabled
+#   make release    -O2, P2P_LOG_LEVEL=LOG_INFO
+#                                     only necessary outputs; debug chatter
+#                                     is compiled out entirely
+#   make debug      explicit alias for the default
+# ---------------------------------------------------------------------------
+
+DEBUG_FLAGS = -std=c++17 $(WARNFLAGS) -g -DP2P_LOG_LEVEL=LOG_DEBUG
+RELEASE_FLAGS = -std=c++17 $(WARNFLAGS) -O2 -DP2P_LOG_LEVEL=LOG_INFO
+
+# Active mode (overridden per-target below; default = debug).
+CXXFLAGS = $(DEBUG_FLAGS)
 
 # Flags for the linker:
 # -lpthread: Link against the POSIX threads library for concurrency.
@@ -51,15 +69,59 @@ CLIENT_SRCS = $(wildcard client/*.cpp)
 COMMON_SRCS = $(wildcard common/*.cpp)
 
 # Generate corresponding .o object file names, placing them in the build directory.
-TRACKER_OBJS = $(patsubst tracker/%.cpp,$(BUILD_DIR)/tracker/%.o,$(TRACKER_SRCS))
-CLIENT_OBJS = $(patsubst client/%.cpp,$(BUILD_DIR)/client/%.o,$(CLIENT_SRCS))
-COMMON_OBJS = $(patsubst common/%.cpp,$(BUILD_DIR)/common/%.o,$(COMMON_SRCS))
+# Objects are rooted at $(OBJ_BASE), which the release target points at a
+# separate tree; otherwise release objects would collide with debug ones.
+OBJ_BASE ?= $(BUILD_DIR)
+TRACKER_OBJS = $(patsubst tracker/%.cpp,$(OBJ_BASE)/tracker/%.o,$(TRACKER_SRCS))
+CLIENT_OBJS = $(patsubst client/%.cpp,$(OBJ_BASE)/client/%.o,$(CLIENT_SRCS))
+COMMON_OBJS = $(patsubst common/%.cpp,$(OBJ_BASE)/common/%.o,$(COMMON_SRCS))
 
 
 # Build Rules 
 
-# The 'all' target is the default. 
-all: $(TRACKER_EXEC) $(CLIENT_EXEC)
+# The 'all' target is the default (debug build with full logging).
+all: debug
+
+debug: $(TRACKER_EXEC) $(CLIENT_EXEC)
+
+# Release build: optimized, quiet logging. OBJ_BASE is switched so release
+# objects live in build_release/ and never collide with debug artifacts.
+# $(TRACKER_EXEC)/$(CLIENT_EXEC) are immediate-expanded variables, so the
+# target names recompute with the overridden OBJ_ROOT too.
+OBJ_ROOT = $(OBJ_BASE)
+
+REL_OBJ_BASE = $(BUILD_DIR)_release
+REL_TRACKER_EXEC = tracker/tracker-release
+REL_CLIENT_EXEC = client/client-release
+REL_TRACKER_OBJS = $(patsubst tracker/%.cpp,$(REL_OBJ_BASE)/tracker/%.o,$(TRACKER_SRCS))
+REL_CLIENT_OBJS = $(patsubst client/%.cpp,$(REL_OBJ_BASE)/client/%.o,$(CLIENT_SRCS))
+REL_COMMON_OBJS = $(patsubst common/%.cpp,$(REL_OBJ_BASE)/common/%.o,$(COMMON_SRCS))
+
+release: $(REL_TRACKER_EXEC) $(REL_CLIENT_EXEC)
+	@echo "--> Release binaries built (quiet logging, -O2)."
+
+$(REL_TRACKER_EXEC): $(REL_TRACKER_OBJS) $(REL_COMMON_OBJS)
+	@echo "==> Linking tracker (release)..."
+	$(CXX) $(RELEASE_FLAGS) -o $@ $^ $(LDFLAGS)
+
+$(REL_CLIENT_EXEC): $(REL_CLIENT_OBJS) $(REL_COMMON_OBJS)
+	@echo "==> Linking client (release)..."
+	$(CXX) $(RELEASE_FLAGS) -o $@ $^ $(LDFLAGS)
+
+$(REL_OBJ_BASE)/tracker/%.o: tracker/%.cpp
+	@mkdir -p $(dir $@)
+	@echo "Compiling (release) $<..."
+	$(CXX) $(RELEASE_FLAGS) $(INCLUDE) -c -o $@ $<
+
+$(REL_OBJ_BASE)/client/%.o: client/%.cpp
+	@mkdir -p $(dir $@)
+	@echo "Compiling (release) $<..."
+	$(CXX) $(RELEASE_FLAGS) $(INCLUDE) -c -o $@ $<
+
+$(REL_OBJ_BASE)/common/%.o: common/%.cpp
+	@mkdir -p $(dir $@)
+	@echo "Compiling (release) $<..."
+	$(CXX) $(RELEASE_FLAGS) $(INCLUDE) -c -o $@ $<
 
 # ---------------------------------------------------------------------------
 # Test targets
@@ -191,7 +253,7 @@ $(BUILD_DIR)/common/%.o: common/%.cpp
 
 # '.PHONY' declares targets that are not actual files.
 # This prevents 'make' from getting confused if a file named 'clean' or 'all' exists.
-.PHONY: all clean test test_sanitize integration check
+.PHONY: all clean test test_sanitize integration check debug release
 
 # End-to-end test: real trackers, real clients, real transfers.
 integration: all
@@ -205,6 +267,7 @@ check: test test_sanitize integration
 # Run 'make clean' to clean up your project directory.
 clean:
 	@echo "==> Cleaning up project..."
-	rm -rf $(BUILD_DIR) $(TEST_BUILD_DIR) $(TEST_SAN_BUILD_DIR)
-	rm -f $(TRACKER_EXEC) $(CLIENT_EXEC)
+	rm -rf $(BUILD_DIR) $(BUILD_DIR)_release $(TEST_BUILD_DIR) $(TEST_SAN_BUILD_DIR)
+	rm -f $(TRACKER_EXEC) $(CLIENT_EXEC) \
+	      tracker/tracker-release client/client-release
 	@echo "--> Cleanup complete."

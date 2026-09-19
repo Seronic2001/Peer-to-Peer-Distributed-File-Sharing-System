@@ -41,11 +41,22 @@ The system is composed of two primary components:
 ## 3. Compilation and Execution
 
 ### Compilation
-The project uses a standard Makefile. To compile both the tracker and client executables, run the following command from the root directory:
+The project uses a standard Makefile with two build modes:
+
 ```bash
-$ make
+$ make            # release build: -O2, verbose logging compiled out
+$ make debug      # debug build: -g -O0 + P2P_DEBUG, full per-command logging
 ```
-This will create two binaries: `./tracker/tracker` and `./client/client`.
+
+Both modes produce `./tracker/tracker` and `./client/client`. They use separate
+object directories (`build/` vs `build/debug/`), so you can switch between them
+without a clean.
+
+**Logging:** all log output is leveled and colored. `ERROR`/`WARN`/important
+events always print; per-command `DEBUG` chatter is compiled out of release
+builds (via the `P2P_LOG_LEVEL` macro) and only enabled by `make debug`.
+Log messages go to stderr, so normal command output on stdout stays clean
+when redirecting.
 
 ### Execution
 The system requires at least one tracker and one client to be running. For a fault-tolerant setup, run both trackers.
@@ -61,10 +72,20 @@ $ ./tracker/tracker tracker_info.txt 2
 
 **Terminal 2 (and others): Start Clients**
 ```bash
-# Start a client, providing the tracker info file
-$ ./client/client tracker_info.txt
+# Start a client: first arg is this peer's own listen address (IP:PORT),
+# second is the tracker info file.
+$ ./client/client 127.0.0.1:6001 tracker_info.txt
 ```
-The client will connect to the Primary tracker and provide a `>>` prompt for commands.
+The client connects to the Primary tracker and shows a colored `alice@p2p >>`
+prompt (dim `anon@p2p` until you log in), with full line editing:
+
+* `←`/`→` move the cursor, `Home`/`End` (or `Ctrl+A`/`Ctrl+E`) jump to the
+  start/end, `Ctrl+U`/`Ctrl+K`/`Ctrl+W` clear line/to end/previous word.
+* `↑`/`↓` walk through command history (up to 200 entries).
+* `Ctrl+L` clears the screen; type `help` for the command list.
+
+Malformed commands, unknown commands, and tracker errors are reported in red
+without ever crashing the client or corrupting the input line.
 
 ---
 

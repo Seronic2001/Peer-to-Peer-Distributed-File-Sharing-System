@@ -58,16 +58,16 @@ int connect_to_peer(const std::string& peer_addr) {
 void peer_worker(DownloadState& state, PeerState& self, int output_fd) {
   self.sock = connect_to_peer(self.peer_address);
   if (self.sock < 0) {
-    log_message("[Peer ", self.peer_address, "] Could not connect.");
+    log_warn("[Peer ", self.peer_address, "] could not connect.");
     self.is_active = false;
     state.peers_ready++;
     return;
   }
 
-  log_message("[Peer ", self.peer_address, "] Connected.");
+  log_debug("[Peer ", self.peer_address, "] Connected.");
   std::string handshake_msg = "HANDSHAKE " + state.file_name;
   if (!sendMessage(self.sock, handshake_msg)) {
-    log_message("[Peer ", self.peer_address, "] Handshake send failed.");
+    log_debug("[Peer ", self.peer_address, "] Handshake send failed.");
     close(self.sock);
     self.is_active = false;
     state.peers_ready++;
@@ -76,7 +76,7 @@ void peer_worker(DownloadState& state, PeerState& self, int output_fd) {
 
   std::string response;
   if (!receiveMessage(self.sock, response) || response != "HANDSHAKE_OK") {
-    log_message("[Peer ", self.peer_address,
+    log_debug("[Peer ", self.peer_address,
                 "] Handshake failed. Resp: ", response);
     close(self.sock);
     self.is_active = false;
@@ -103,17 +103,17 @@ void peer_worker(DownloadState& state, PeerState& self, int output_fd) {
         }
       }
       self.is_active = true;
-      log_message("[Peer ", self.peer_address,
-                  "] BITFIELD received. Active and has ",
+      log_debug("[Peer ", self.peer_address,
+                "] BITFIELD received. Active and has ",
                   std::count(self.bitfield.begin(), self.bitfield.end(), true),
                   " pieces.");
     } else {
-      log_message("[Peer ", self.peer_address,
-                  "] BITFIELD malformed or wrong length: ", data.length());
+      log_debug("[Peer ", self.peer_address,
+                "] BITFIELD malformed or wrong length: ", data.length());
       self.is_active = false;
     }
   } else {
-    log_message("[Peer ", self.peer_address, "] No BITFIELD received.");
+    log_debug("[Peer ", self.peer_address, "] No BITFIELD received.");
     self.is_active = false;
   }
 
@@ -160,9 +160,9 @@ void peer_worker(DownloadState& state, PeerState& self, int output_fd) {
 
         if (sp2 == std::string::npos || !index_ok ||
             received_index != piece_to_download) {
-          log_message("[Peer ", self.peer_address,
-                      "] Malformed PIECE response for piece ",
-                      piece_to_download);
+          log_debug("[Peer ", self.peer_address,
+                "] Malformed PIECE response for piece ",
+                piece_to_download);
         } else {
           size_t data_start = sp2 + 1;
           const char* piece_data = piece_response.data() + data_start;
@@ -179,21 +179,21 @@ void peer_worker(DownloadState& state, PeerState& self, int output_fd) {
                   (ssize_t)data_len) {
                 success = true;
               } else {
-                log_message("[Peer ", self.peer_address,
-                            "] Short or failed write for piece ",
-                            piece_to_download);
+                log_debug("[Peer ", self.peer_address,
+                "] Short or failed write for piece ",
+                piece_to_download);
               }
             }
           } else {
-            log_message("[Peer ", self.peer_address,
-                        "] Hash mismatch for piece ", piece_to_download,
-                        ". Retrying...");
+            log_debug("[Peer ", self.peer_address,
+                "] Hash mismatch for piece ", piece_to_download,
+                ". Retrying...");
           }
         }
       }
     } else {
-      log_message("[Peer ", self.peer_address, "] Failed to receive piece ",
-                  piece_to_download);
+      log_debug("[Peer ", self.peer_address, "] Failed to receive piece ",
+                piece_to_download);
     }
 
     {
@@ -201,8 +201,8 @@ void peer_worker(DownloadState& state, PeerState& self, int output_fd) {
       if (success) {
         state.pieces_we_have[piece_to_download] = true;
         state.downloaded_piece_count++;
-        log_message("[Peer ", self.peer_address, "] Downloaded piece ",
-                    piece_to_download, " (",
+        log_debug("[Peer ", self.peer_address, "] Downloaded piece ",
+                piece_to_download, " (",
                     state.downloaded_piece_count.load(), "/", state.num_pieces,
                     ")");
       } else {
@@ -211,8 +211,8 @@ void peer_worker(DownloadState& state, PeerState& self, int output_fd) {
         state.piece_failures[piece_to_download]++;
         if (state.piece_failures[piece_to_download] >= MAX_PIECE_ATTEMPTS) {
           state.pieces_exhausted[piece_to_download] = true;
-          log_message("[Peer ", self.peer_address, "] Piece ",
-                      piece_to_download, " exhausted its retry budget.");
+          log_debug("[Peer ", self.peer_address, "] Piece ",
+                piece_to_download, " exhausted its retry budget.");
         }
       }
       self.assigned_piece = -1;
@@ -227,19 +227,19 @@ void start_download(std::shared_ptr<DownloadState> state) {
   // Instantiate the correct piece selection algorithm
   if (state->algorithm == "sequential") {
     state->piece_selector = std::make_unique<SequentialSelector>();
-    log_message(
+    log_debug(
         "[Download Manager] Using 'sequential' piece selection algorithm.");
   } else if (state->algorithm == "random") {
     state->piece_selector = std::make_unique<RandomSelector>();
-    log_message("[Download Manager] Using 'random' piece selection algorithm.");
+    log_debug("[Download Manager] Using 'random' piece selection algorithm.");
   } else {
     state->piece_selector = std::make_unique<RarestFirstSelector>();
     if (state->algorithm != "rarest") {
-      log_message("[Download Manager] Unknown algorithm '", state->algorithm,
+      log_warn("[Download Manager] Unknown algorithm '", state->algorithm,
                   "'. Defaulting to 'rarest'.");
     } else {
-      log_message(
-          "[Download Manager] Using 'rarest' piece selection algorithm.");
+      log_debug(
+        "[Download Manager] Using 'rarest' piece selection algorithm.");
     }
   }
 
@@ -254,7 +254,7 @@ void start_download(std::shared_ptr<DownloadState> state) {
   int output_fd =
       open(state->destination_path.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0666);
   if (output_fd < 0) {
-    log_message("Error: Could not open destination file: ",
+    log_error("Could not open destination file: ",
                 state->destination_path);
     return;
   }
@@ -276,9 +276,8 @@ void start_download(std::shared_ptr<DownloadState> state) {
   }
 
   if (active_count == 0) {
-    log_message(
-        "[Download Manager] ERROR: No active peers with pieces. Aborting "
-        "download.");
+    log_error(
+        "[Download Manager] No active peers with pieces. Aborting download.");
     state->download_complete = true;  // Ensure we signal main thread on abort
     state->cv.notify_all();
     for (auto& t : peer_threads) {
@@ -290,8 +289,8 @@ void start_download(std::shared_ptr<DownloadState> state) {
     return;
   }
 
-  log_message(
-      "[Download Manager] Peer connection attempts finished. Active peers: ",
+  log_debug(
+        "[Download Manager] Peer connection attempts finished. Active peers: ",
       active_count, "/", state->peers.size(), ". Starting piece selection.");
 
   while (state->downloaded_piece_count < state->num_pieces) {
@@ -308,14 +307,14 @@ void start_download(std::shared_ptr<DownloadState> state) {
             p.assigned_piece = piece_idx;
             work_assigned = true;
           } else {
-            log_message("[Download Manager] Peer ", p.peer_address,
-                        " does not have piece ", piece_idx,
-                        " or bitfield too short.");
+            log_debug("[Download Manager] Peer ", p.peer_address,
+                    " does not have piece ", piece_idx,
+                    " or bitfield too short.");
           }
         } else {
-          log_message(
-              "[Download Manager] select_piece() returned -1 (no piece "
-              "available now).");
+          log_debug(
+        "[Download Manager] select_piece() returned -1 (no piece "
+        "available now).");
           break;
         }
       }
@@ -337,7 +336,7 @@ void start_download(std::shared_ptr<DownloadState> state) {
       }
       lock.unlock();
       if (!any_in_progress) {
-        log_message(
+        log_error(
             "[Download Manager] No active peer can serve the remaining "
             "pieces. Aborting download.");
         break;
@@ -353,17 +352,16 @@ void start_download(std::shared_ptr<DownloadState> state) {
       FileHashes downloaded_hashes = compute_hashes(state->destination_path);
       if (downloaded_hashes.concatenated_hashes ==
           state->concatenated_piece_hashes) {
-        log_message("[Download Manager] Final file verification successful.");
+        log_success("[Download Manager] Final file verification successful.");
         success = true;
       } else {
-        log_message("[Download Manager] FINAL HASH MISMATCH! File is corrupt.");
+        log_error("[Download Manager] FINAL HASH MISMATCH! File is corrupt.");
       }
     } catch (...) {
-      log_message(
-          "[Download Manager] Exception during final hash verification.");
+      log_error("[Download Manager] Exception during final hash verification.");
     }
   } else {
-    log_message("[Download Manager] Download did not complete all pieces.");
+    log_warn("[Download Manager] Download did not complete all pieces.");
   }
 
   state->download_successful = success;
@@ -379,5 +377,5 @@ void start_download(std::shared_ptr<DownloadState> state) {
   close(output_fd);
 
   log_message("[Download Manager] Download process finished for ",
-              state->file_name);
+                state->file_name);
 }

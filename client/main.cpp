@@ -13,6 +13,8 @@
 #include <cmath>
 #include <condition_variable>
 #include <cstdlib>
+#include <cstring>
+#include <fstream>
 #include <memory>
 #include <mutex>
 #include <sstream>
@@ -74,6 +76,7 @@ std::string get_application_home() {
 
 void disable_raw_mode() {
   tcsetattr(STDIN_FILENO, TCSAFLUSH, &orig_termios);
+  ui::raw_mode_active.store(false);
 }
 
 void enable_raw_mode() {
@@ -85,6 +88,7 @@ void enable_raw_mode() {
   raw.c_cflag |= (CS8);
   raw.c_lflag &= ~(ECHO | ICANON | IEXTEN | ISIG);
   tcsetattr(STDIN_FILENO, TCSAFLUSH, &raw);
+  ui::raw_mode_active.store(true);
 }
 
 // Builds the dynamic colored prompt: green user when logged in, dim red
@@ -127,29 +131,201 @@ void log_tracker_response(const std::string& response) {
 void print_help() {
   const auto cmd = [](const std::string& name, const std::string& args,
                       const std::string& desc) {
-    log_message("  ", ui::bold_color(ui::GREEN, name), " ",
-                ui::styled(ui::DIM, args), desc);
+    std::string pad1(16 > name.size() ? 16 - name.size() : 1, ' ');
+    std::string pad2(29 > args.size() ? 29 - args.size() : 1, ' ');
+    log_message("  ", ui::bold_color(ui::GREEN, name), pad1,
+                ui::styled(ui::DIM, args), pad2, desc);
   };
   log_message(ui::bold_color(ui::MAGENTA, "Commands:"));
-  cmd("create_user", "<user_id> <password>", "  register");
-  cmd("login", "<user_id> <password>", "            authenticate");
-  cmd("logout", "", "                        end session");
-  cmd("create_group", "<group_id>", "             new group (owner = you)");
-  cmd("join_group", "<group_id>", "              request to join");
-  cmd("leave_group", "<group_id>", "             leave a group");
-  cmd("accept_request", "<group_id> <user_id>", "approve a join request");
-  cmd("list_groups", "", "                   groups you can see");
-  cmd("list_requests", "<group_id>", "          pending join requests");
-  cmd("list_files", "<group_id>", "             files shared in a group");
-  cmd("upload_file", "<group_id> <file_path>", "  share a file");
-  cmd("download_file", "<group> <file> <dest> [alg]", "alg: rarest|sequential|random");
-  cmd("stop_share", "<group_id> <file_name>", "  stop seeding");
-  cmd("show_downloads", "", "                active/finished downloads");
-  cmd("quit", "", "                           exit the client");
+  cmd("create_user", "<user_id> <password>", "register a new user");
+  cmd("login", "<user_id> <password>", "authenticate user session");
+  cmd("logout", "", "end current session");
+  cmd("create_group", "<group_id>", "create group (owner = you)");
+  cmd("join_group", "<group_id>", "request to join a group");
+  cmd("leave_group", "<group_id>", "leave a group");
+  cmd("accept_request", "<group_id> <user_id>", "approve a pending join request");
+  cmd("list_groups", "", "list all groups in network");
+  cmd("list_requests", "<group_id>", "list pending join requests");
+  cmd("list_files", "<group_id>", "list files shared in group");
+  cmd("upload_file", "<group_id> <file_path>", "share a file with group");
+  cmd("download_file", "<group> <file> <dest> [alg]", "download [alg: rarest|sequential|random]");
+  cmd("stop_share", "<group_id> <file_name>", "stop sharing a file");
+  cmd("show_downloads", "", "show active and finished downloads");
+  cmd("quit", "", "exit the client");
   log_message(ui::styled(ui::DIM,
-                         "Keys: Up/Down history · Left/Right move · Home/End · "
-                         "Ctrl+U clear · Ctrl+W delete word"));
+                         "Keys: Tab complete · Up/Down history · Left/Right move · "
+                         "Home/End · Ctrl+U clear · Ctrl+W delete word"));
 }
+
+// ----------------------------------------------------------------------------
+// Tab completion + persistent history
+// ----------------------------------------------------------------------------
+
+namespace {
+
+// Commands offered for first-word completion (kept in sync with print_help).
+const std::vector<std::string>& known_commands() {
+  static const std::vector<std::string> cmds = {
+      "create_user",     "login",          "logout",           "create_group",
+      "join_group",      "leave_group",    "accept_request",   "list_groups",
+      "list_requests",   "list_files",     "upload_file",      "download_file",
+      "stop_share",      "show_downloads", "help",             "quit",
+      "exit",
+  };
+  return cmds;
+}
+
+const size_t kMaxHistoryEntries = 200;  // In memory and on disk.
+
+std::string history_file_path() {
+  return get_application_home() + "/.p2p_client_history";
+}
+
+// Loads the history file, keeping only the newest kMaxHistoryEntries.
+// A missing or malformed file simply yields an empty history. When the file
+// held more entries than we keep, it is rewritten trimmed so it cannot grow
+// without bound.
+void load_history() {
+  std::ifstream in(history_file_path());
+  if (!in) return;
+  std::vector<std::string> all;
+  std::string line;
+  while (std::getline(in, line)) {
+    if (!line.empty()) all.push_back(line);
+  }
+  in.close();
+  if (all.empty()) return;
+
+  const size_t overflow =
+      all.size() > kMaxHistoryEntries ? all.size() - kMaxHistoryEntries : 0;
+  input_history.assign(all.begin() + overflow, all.end());
+  history_nav = input_history.size();
+
+  if (overflow > 0) {  // Rewrite the file trimmed to the retained tail.
+    std::ofstream out(history_file_path(), std::ios::trunc);
+    for (const auto& cmd : input_history) out << cmd << "\n";
+  }
+  log_debug("[History] Loaded ", input_history.size(), " commands from ",
+            history_file_path());
+}
+
+// Adds a command to the in-memory history (dedup consecutive duplicates,
+// like bash) and appends it to the history file so it survives restarts.
+// Called from the input thread only.
+void record_command(const std::string& cmd) {
+  if (cmd.empty()) return;
+  if (input_history.empty() || input_history.back() != cmd) {
+    input_history.push_back(cmd);
+    if (input_history.size() > kMaxHistoryEntries)
+      input_history.erase(input_history.begin());
+    std::ofstream out(history_file_path(), std::ios::app);
+    if (out) out << cmd << "\n";
+  }
+  history_nav = input_history.size();
+}
+
+// Completes the word before the cursor: command names for the first word,
+// file paths for later words. Inserts the longest common prefix when several
+// candidates match, otherwise lists them above the prompt. Never throws and
+// never crashes; caller must hold cout_mutex.
+void tab_complete() {
+  size_t word_start = cursor_pos;
+  while (word_start > 0 &&
+         !isspace((unsigned char)current_line[word_start - 1]))
+    --word_start;
+  const std::string prefix =
+      current_line.substr(word_start, cursor_pos - word_start);
+  if (prefix.empty()) return;
+
+  std::vector<std::string> matches;
+  if (word_start == 0) {
+    for (const auto& cmd : known_commands())
+      if (cmd.rfind(prefix, 0) == 0) matches.push_back(cmd);
+  } else {
+    // Split the prefix into directory + filename and list the directory.
+    std::string dir = ".";
+    std::string file_part = prefix;
+    const size_t slash = prefix.rfind('/');
+    if (slash != std::string::npos) {
+      dir = prefix.substr(0, slash + 1);
+      file_part = prefix.substr(slash + 1);
+    }
+    if (!dir.empty() && dir[0] == '~') {  // Basic ~ expansion.
+      if (const char* home = getenv("HOME")) {
+        if (dir == "~") {
+          dir = home;
+        } else if (dir.rfind("~/", 0) == 0) {
+          dir = std::string(home) + dir.substr(1);
+        }
+      }
+    }
+    if (DIR* d = opendir(dir.c_str())) {
+      struct dirent* ent;
+      while ((ent = readdir(d)) != nullptr) {
+        const std::string name = ent->d_name;
+        if (name == "." || name == "..") continue;
+        if (name.rfind(file_part, 0) != 0) continue;
+        if (name[0] == '.' && (file_part.empty() || file_part[0] != '.'))
+          continue;  // Hide dotfiles unless explicitly asked for.
+        const std::string full = (dir == ".") ? name : dir + name;
+        std::string match = full;
+        struct stat st;
+        if (stat(full.c_str(), &st) == 0 && S_ISDIR(st.st_mode))
+          match += "/";  // Walkable paths for directory matches.
+        matches.push_back(match);
+      }
+      closedir(d);
+    }
+  }
+
+  if (matches.empty()) return;
+  if (matches.size() == 1) {
+    std::string completion = matches[0];
+    if (word_start == 0 && completion.back() != '/') completion += " ";
+    current_line.replace(word_start, cursor_pos - word_start, completion);
+    cursor_pos = word_start + completion.size();
+    redraw_line();
+    return;
+  }
+
+  // Multiple matches: complete the longest common prefix first.
+  std::string lcp = matches[0];
+  for (const auto& m : matches) {
+    size_t k = 0;
+    while (k < lcp.size() && k < m.size() && lcp[k] == m[k]) ++k;
+    lcp.resize(k);
+  }
+  if (lcp.size() > prefix.size()) {
+    current_line.replace(word_start, cursor_pos - word_start, lcp);
+    cursor_pos = word_start + lcp.size();
+    redraw_line();
+    return;
+  }
+
+  // Nothing more to type: list the matches above the prompt. Raw mode has
+  // OPOST off, so every line break must be an explicit "\r\n".
+  const size_t kMaxListed = 50;
+  std::cout << "\r\n";
+  size_t col = 0;
+  size_t shown = 0;
+  for (const auto& m : matches) {
+    if (shown++ == kMaxListed) {
+      std::cout << "  ... and " << (matches.size() - kMaxListed) << " more\r\n";
+      break;
+    }
+    std::string cell = m;
+    if (cell.size() < 18) cell.append(18 - cell.size(), ' ');
+    std::cout << ui::styled(ui::CYAN, cell);
+    if (++col == 4) {
+      std::cout << "\r\n";
+      col = 0;
+    }
+  }
+  if (col != 0) std::cout << "\r\n";
+  redraw_line();
+}
+
+}  // namespace
 
 // Helper to check connection health
 bool safe_send(int sockfd, const std::string& msg) {
@@ -231,7 +407,10 @@ void save_metadata_file(const std::string& user_id,
   ss << "hashes:" << hashes << "\n";
   std::string content = ss.str();
 
-  write(fd, content.c_str(), content.length());
+  if (write(fd, content.c_str(), content.length()) < 0) {
+    log_error("Could not save metadata for '", file_name, "': ",
+              strerror(errno));
+  }
   close(fd);
 }
 
@@ -454,8 +633,11 @@ int main(int argc, char const* argv[]) {
 
   bool is_peer_server_running = false;
 
-  // Main Input Loop
-  enable_raw_mode();
+  // Load persisted history from previous runs before the input loop starts.
+  load_history();
+
+  // Print welcome banner before entering raw mode so it formats cleanly
+  // across all terminal environments.
   {
     std::lock_guard<std::mutex> lock(cout_mutex);
     std::cout << "\n"
@@ -470,7 +652,14 @@ int main(int argc, char const* argv[]) {
               << "\n\n"
               << ui::styled(ui::DIM,
                             "  Type 'help' for commands, 'quit' to stop.")
-              << "\n\n";
+              << "\n\n"
+              << std::flush;
+  }
+
+  // Main Input Loop
+  enable_raw_mode();
+  {
+    std::lock_guard<std::mutex> lock(cout_mutex);
     redraw_line();
     std::cout << std::flush;
   }
@@ -570,15 +759,9 @@ int main(int argc, char const* argv[]) {
         current_line.clear();
         cursor_pos = 0;
 
-        // Remember the command in history (skip empty lines and exact
-        // consecutive duplicates, like bash).
-        if (!command_to_process.empty() &&
-            (input_history.empty() ||
-             input_history.back() != command_to_process)) {
-          input_history.push_back(command_to_process);
-          if (input_history.size() > 200) input_history.erase(input_history.begin());
-        }
-        history_nav = input_history.size();
+        // Remember the command (dedup consecutive duplicates like bash) in
+        // memory and in the history file so it survives restarts.
+        record_command(command_to_process);
 
         log_message(ui::styled(ui::DIM, "ran: "), command_to_process);
 
@@ -1007,6 +1190,9 @@ int main(int argc, char const* argv[]) {
         }
         // Any other escape sequence: ignored (never crashes, never leaks
         // bytes into the command line).
+      } else if (c == 9) {  // Tab: complete commands / file paths.
+        std::lock_guard<std::mutex> lock(cout_mutex);
+        tab_complete();
       } else if (c == 1) {  // Ctrl+A: home.
         cursor_pos = 0;
         std::lock_guard<std::mutex> lock(cout_mutex);

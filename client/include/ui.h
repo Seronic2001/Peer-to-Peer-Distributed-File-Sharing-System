@@ -21,6 +21,7 @@
 // corrupting the line editor's state.
 // ----------------------------------------------------------------------------
 
+#include <atomic>
 #include <iostream>
 #include <mutex>
 #include <sstream>
@@ -40,6 +41,8 @@ extern void redraw_line();
 
 // ----- ANSI styling -----
 namespace ui {
+
+inline std::atomic<bool> raw_mode_active{false};
 
 inline constexpr const char* RESET = "\x1b[0m";
 inline constexpr const char* BOLD = "\x1b[1m";
@@ -86,7 +89,22 @@ void emit(Level level, const char* color, const char* tag, Args... args) {
   (void)color;
 
   std::lock_guard<std::mutex> lock(cout_mutex);
-  std::cout << "\r" << CLEAR_EOL << out << "\n";
+  if (!raw_mode_active.load()) {
+    std::cout << out << "\n" << std::flush;
+    return;
+  }
+
+  std::string safe_out;
+  safe_out.reserve(out.size() + 16);
+  for (size_t i = 0; i < out.size(); ++i) {
+    if (out[i] == '\n' && (i == 0 || out[i - 1] != '\r')) {
+      safe_out += "\r\n";
+    } else {
+      safe_out += out[i];
+    }
+  }
+
+  std::cout << "\r" << CLEAR_EOL << safe_out << "\r\n";
   redraw_line();
   std::cout << std::flush;
 }

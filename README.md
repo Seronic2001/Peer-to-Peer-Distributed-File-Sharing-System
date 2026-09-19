@@ -82,6 +82,13 @@ prompt (dim `anon@p2p` until you log in), with full line editing:
 * `←`/`→` move the cursor, `Home`/`End` (or `Ctrl+A`/`Ctrl+E`) jump to the
   start/end, `Ctrl+U`/`Ctrl+K`/`Ctrl+W` clear line/to end/previous word.
 * `↑`/`↓` walk through command history (up to 200 entries).
+* `Tab` completes commands for the first word (e.g. `li<Tab>` → `list_`,
+  then lists `list_groups` / `list_requests` / `list_files`) and file paths
+  for later words (e.g. `upload_file g1 ./te<Tab>` → `./testdata.txt`),
+  inserting the longest common prefix and listing ambiguous matches.
+* Command history persists across runs in
+  `~/.p2p_client_history` (deduplicated, capped at 200 entries), so `↑`
+  still recalls commands from previous sessions.
 * `Ctrl+L` clears the screen; type `help` for the command list.
 
 Malformed commands, unknown commands, and tracker errors are reported in red

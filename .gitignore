@@ -1,5 +1,7 @@
 #Build Folder
 build/
+tests/build/
+tests/build_san/
 
 #Executables
 tracker/tracker

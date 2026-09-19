@@ -9,6 +9,10 @@
 
 #include "piece_selector.h"
 
+// A piece is abandoned (and excluded from selection) after this many failed
+// download attempts, so one bad peer cannot stall a download forever.
+constexpr int MAX_PIECE_ATTEMPTS = 5;
+
 // Forward declaration
 class PieceSelector;
 
@@ -35,6 +39,8 @@ struct DownloadState {
   std::vector<PeerState> peers;
   std::vector<bool> pieces_we_have;
   std::vector<bool> pieces_in_progress;
+  std::vector<bool> pieces_exhausted;  // pieces that failed too many times
+  std::vector<int> piece_failures;     // per-piece failed attempt counts
   std::vector<int> piece_rarity;
 
   std::atomic<int> peers_ready{0};

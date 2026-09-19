@@ -12,7 +12,8 @@ int RarestFirstSelector::select_piece(DownloadState& state) {
 
   // Find the rarest piece that we don't have and isn't already in progress.
   for (int i = 0; i < state.num_pieces; ++i) {
-    if (!state.pieces_we_have[i] && !state.pieces_in_progress[i]) {
+    if (!state.pieces_we_have[i] && !state.pieces_in_progress[i] &&
+        !state.pieces_exhausted[i]) {
       // Check if this piece is rarer than the best one we've found so far.
       if (state.piece_rarity[i] < min_rarity) {
         // Ensure at least one of our active peers actually has this piece.
@@ -37,7 +38,8 @@ int RarestFirstSelector::select_piece(DownloadState& state) {
 int SequentialSelector::select_piece(DownloadState& state) {
   // Find the first piece we don't have and that isn't in progress.
   for (int i = 0; i < state.num_pieces; ++i) {
-    if (!state.pieces_we_have[i] && !state.pieces_in_progress[i]) {
+    if (!state.pieces_we_have[i] && !state.pieces_in_progress[i] &&
+        !state.pieces_exhausted[i]) {
       // Check if any of our active peers have this piece.
       for (const auto& p : state.peers) {
         if (p.is_active && p.bitfield.size() > (size_t)i && p.bitfield[i]) {
@@ -55,7 +57,8 @@ int RandomSelector::select_piece(DownloadState& state) {
   std::vector<int> available_pieces;
   // Find all pieces we need and that are available from at least one peer.
   for (int i = 0; i < state.num_pieces; ++i) {
-    if (!state.pieces_we_have[i] && !state.pieces_in_progress[i]) {
+    if (!state.pieces_we_have[i] && !state.pieces_in_progress[i] &&
+        !state.pieces_exhausted[i]) {
       for (const auto& p : state.peers) {
         if (p.is_active && p.bitfield.size() > (size_t)i && p.bitfield[i]) {
           available_pieces.push_back(i);

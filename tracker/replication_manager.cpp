@@ -213,14 +213,44 @@ void ReplicationManager::run_backup_mode() {
   primary_addr.sin_port = htons(other_tracker_info.port + 1000);
   inet_pton(AF_INET, other_tracker_info.ip.c_str(), &primary_addr.sin_addr);
 
-  // Keep trying to connect to the primary
-  while (connect(primary_sock, (struct sockaddr*)&primary_addr,
-                 sizeof(primary_addr)) < 0) {
+  // Connect with a bounded timeout: a blocking connect() to a dead peer can
+  // hang for minutes, delaying failover. On timeout, close and retry so the
+  // election loop (and should_stop) stays responsive.
+  int conn_err = 0;
+  while (true) {
+    if (connect(primary_sock, (struct sockaddr*)&primary_addr,
+                sizeof(primary_addr)) == 0) {
+      break;  // Connected.
+    }
+    if (errno == EINTR) {
+      continue;
+    }
+    if (errno != EINPROGRESS) {
+      conn_err = errno;  // Hard failure (refused/unreachable): retry below.
+    } else {
+      fd_set wfds;
+      FD_ZERO(&wfds);
+      FD_SET(primary_sock, &wfds);
+      struct timeval timeout;
+      timeout.tv_sec = 2;
+      timeout.tv_usec = 0;
+      int rc = select(primary_sock + 1, NULL, &wfds, NULL, &timeout);
+      if (rc > 0) {
+        socklen_t err_len = sizeof(conn_err);
+        getsockopt(primary_sock, SOL_SOCKET, SO_ERROR, &conn_err, &err_len);
+      } else {
+        conn_err = ETIMEDOUT;
+      }
+    }
+
     if (should_stop) {
       close(primary_sock);
       return;
     }
-    log_tracker("[Replication] Could not connect to primary. Retrying...");
+    log_tracker("[Replication] Could not connect to primary (",
+                strerror(conn_err), "). Retrying...");
+    close(primary_sock);
+    primary_sock = socket(AF_INET, SOCK_STREAM, 0);
     std::this_thread::sleep_for(std::chrono::seconds(2));
   }
 

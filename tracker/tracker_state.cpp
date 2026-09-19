@@ -412,6 +412,17 @@ void TrackerState::process_replicated_command(const std::string& command_str) {
     return;
   std::string command = tokens[0];
 
+  // Sanitize command arguments: whitespace never survives tokenization
+  // (stream >> collapses runs), but control characters could ride along in a
+  // crafted replicated command and desynchronize the backup's state.
+  for (auto& t : tokens) {
+    for (char& ch : t) {
+      if (static_cast<unsigned char>(ch) < 32) {
+        ch = '?';
+      }
+    }
+  }
+
   if (command == "create_user" && tokens.size() == 3)
     handle_create_user(tokens[1], tokens[2]);
   else if (command == "login" && tokens.size() == 4) {
@@ -428,7 +439,13 @@ void TrackerState::process_replicated_command(const std::string& command_str) {
   else if (command == "accept_request" && tokens.size() == 4)
     handle_accept_request(tokens[1], tokens[2], tokens[3]);
   else if (command == "upload_file" && tokens.size() == 6) {
-    long long file_size = std::stoll(tokens[3]);
+    long long file_size = 0;
+    try {
+      file_size = std::stoll(tokens[3]);
+    } catch (const std::exception&) {
+      log_tracker("[Replication] Dropping malformed upload_file command.");
+      return;
+    }
     handle_upload_file(tokens[1], tokens[2], file_size, tokens[4], tokens[5]);
   } else if (command == "stop_share" && tokens.size() == 4)
     handle_stop_share(tokens[1], tokens[2], tokens[3]);

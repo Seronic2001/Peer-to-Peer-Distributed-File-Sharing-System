@@ -9,8 +9,9 @@ This project is a peer-to-peer (P2P) distributed file sharing system implemented
 4.  [System Design and Implementation](#4-system-design-and-implementation)
 5.  [Key Algorithms](#5-key-algorithms)
 6.  [Network Protocol](#6-network-protocol)
-7.  [Assumptions and Limitations](#7-assumptions-and-limitations)
-8.  [Testing Procedures](#8-testing-procedures)
+7.  [Testing](#7-testing)
+8.  [Assumptions and Limitations](#8-assumptions-and-limitations)
+9.  [Manual Test Procedures](#9-manual-test-procedures)
 
 ---
 
@@ -33,6 +34,7 @@ The system is composed of two primary components:
 * **Partial Seeding:** A client can begin uploading pieces it has already downloaded to other peers, even before its own download is 100% complete.
 * **File Integrity:** All files and file pieces are verified using **SHA1 hashes** to ensure data is not corrupted during transfer.
 * **Robust Concurrency:** The system is heavily multi-threaded and uses thread-safe data structures and synchronization primitives (`std::mutex`, `std::condition_variable`) to handle concurrent operations safely and efficiently.
+* **Tested:** A dependency-free unit test suite (48 tests, runs under AddressSanitizer + UBSan) plus an end-to-end integration harness covering real transfers, tracker failover, and corrupt-peer resilience. See [Testing](#9-testing).
 
 ---
 
@@ -136,7 +138,47 @@ All communication occurs over TCP sockets using a custom, length-prefixed protoc
 
 ---
 
-## 7. Assumptions and Limitations
+## 7. Testing
+
+The project ships with a three-layer test rig, all wired into the Makefile:
+
+```bash
+make test            # unit tests (fast, no sanitizers)
+make test_sanitize   # same suite under ASan + UBSan with leak detection
+make integration     # end-to-end: real trackers, real clients, real transfers
+make check           # all three, in order
+```
+
+### Unit tests (`tests/test_*.cpp`)
+A minimal dependency-free framework (`tests/test_assert.h`) with `TEST(name)`,
+`TEST_ASSERT`, `TEST_ASSERT_EQ`, and `TEST_ASSERT_THROWS`. Each binary links
+only the objects it exercises, so failures isolate the offending module:
+
+| Suite | Covers |
+|---|---|
+| `test_protocol` | Length-prefixed framing: round-trips, binary payloads with NUL bytes, >1 MB messages through the partial send/recv loops, message coalescing, `EINTR` retries, oversized-prefix rejection, send/recv on closed sockets |
+| `test_hashing` | SHA-1 known-answer vectors, piece boundaries (exact multiples, partial final piece, empty file), missing-file error |
+| `test_tracker_state` | User/group/file semantics, owner promotion, leecher lifecycle, replication replay equivalence (backup state must match primary), malformed/controlled-command tolerance, `FULL_STATE_SYNC` rebuild |
+| `test_download_logic` | Piece-selection strategies: rarest-first ordering, availability filtering, exhausted-piece skipping, sequential and random validity, empty-state handling |
+
+### Integration tests (`tests/integration_test.sh`)
+Boots the real topology (2 trackers + clients driven through stdin FIFOs) and
+verifies four scenarios:
+
+1. **S1** — single-seeder transfer; the downloaded file must be byte-identical (`cmp`).
+2. **S2** — multi-peer download from two seeders simultaneously.
+3. **S3** — tracker failover: the primary is killed; the backup must promote and serve a brand-new client.
+4. **S4** — corrupt-source resilience: the seeder's on-disk bytes are flipped mid-download; per-piece hash verification must reject the bad data (the completed download is compared against a pristine copy).
+
+The harness is hang-proof by construction: FIFO writes are timeout-guarded
+against dead readers, port probes are bounded, and it cleans up all spawned
+processes on exit. Run it with `--keep` to preserve logs under
+`$TMPDIR/p2p_itest/logs` for debugging.
+
+> **Port plan:** trackers listen on 5101/5102, replication uses 6101/6102
+> (tracker port + 1000), and test clients bind 7101-7106.
+
+## 8. Assumptions and Limitations
 
 ### Assumptions
 * The network consists of exactly two trackers as defined in `tracker_info.txt`.
@@ -146,12 +188,13 @@ All communication occurs over TCP sockets using a custom, length-prefixed protoc
 ### Limitations
 * **Tracker State is Ephemeral:** As per the design, if both trackers shut down simultaneously, all user, group, and file metadata is lost. The system is highly available but not persistent on the tracker side.
 * **Seeding is Path-Dependent:** As hardlinks were removed for simplicity, seeding relies on the original file remaining at its absolute path. If the user moves, renames, or deletes the file, seeding will break.
+* **Peer Addresses Are Session State:** Peer addresses are not replicated to the backup; on failover all sessions are invalidated and clients must re-login (which re-publishes their addresses to the new primary).
 
 ---
 
-## 8. Testing Procedures
+## 9. Manual Test Procedures
 
-A typical test scenario can be conducted as follows:
+A typical manual scenario can be conducted as follows:
 1.  **Generate Test Files:** Use the `dd` command to create files of various sizes (e.g., 10MB, 500MB).
 2.  **Start System:** Launch both trackers and at least two clients in separate terminals.
 3.  **Create Users & Groups:**
@@ -179,5 +222,5 @@ A typical test scenario can be conducted as follows:
 5.  **Download the File:** On Client B, download the file.
     ```bash
     >> list_files testgroup
-    >> download_file testgroup testfile_500MB.dat ./downloads/
+    >> download_file testgroup testfile_500MB.dat ./downloads/ [rarest|sequential|random]
     ```

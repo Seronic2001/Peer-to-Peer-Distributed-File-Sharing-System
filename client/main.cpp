@@ -351,6 +351,11 @@ int main(int argc, char const* argv[]) {
   struct sockaddr_in peer_addr;
   peer_addr.sin_family = AF_INET;
   peer_addr.sin_port = htons(self_port);
+  // Allow rebinding after a restart while old connections from this port
+  // sit in TIME_WAIT (mirrors the tracker's socket setup).
+  int peer_opt = 1;
+  setsockopt(peer_server_fd, SOL_SOCKET, SO_REUSEADDR, &peer_opt,
+             sizeof(peer_opt));
   if (inet_pton(AF_INET, self_ip.c_str(), &peer_addr.sin_addr) <= 0) {
     log_message("Invalid listening IP address provided.");
     close(peer_server_fd);
@@ -591,17 +596,54 @@ int main(int argc, char const* argv[]) {
                 continue;
 
               if (response.rfind("SUCCESS", 0) == 0) {
-                std::stringstream resp_ss(response);
-                std::string
-                    status_prefix;  // We read the "SUCCESS:" part to discard it
-                resp_ss >> status_prefix;
+                // Parse the response without stream-extraction on the whole
+                // string: the hash blob can legitimately contain embedded
+                // characters that confuse >> tokenization. Format is
+                // "SUCCESS: <file_size> <hashes> [peer ...]".
+                size_t body_start = response.find(':');
+                body_start = (body_start == std::string::npos)
+                                 ? std::string::npos
+                                 : response.find_first_not_of(' ',
+                                                              body_start + 1);
+                size_t size_end = (body_start == std::string::npos)
+                                      ? std::string::npos
+                                      : response.find(' ', body_start);
+                size_t hashes_start = (size_end == std::string::npos)
+                                          ? std::string::npos
+                                          : size_end + 1;
+                size_t hashes_end = (hashes_start == std::string::npos)
+                                        ? std::string::npos
+                                        : response.find(' ', hashes_start);
 
-                long long file_size;
+                long long file_size = -1;
                 std::string all_hashes;
-                resp_ss >> file_size >> all_hashes;
+                bool parse_ok = false;
+                if (body_start != std::string::npos &&
+                    size_end != std::string::npos &&
+                    hashes_end != std::string::npos) {
+                  try {
+                    file_size = std::stoll(
+                        response.substr(body_start, size_end - body_start));
+                    all_hashes = response.substr(hashes_start,
+                                                 hashes_end - hashes_start);
+                    parse_ok = (file_size >= 0 &&
+                                all_hashes.length() % 40 == 0);
+                  } catch (const std::exception&) {
+                    parse_ok = false;
+                  }
+                }
+
+                if (!parse_ok) {
+                  log_message("Error: Malformed download response from "
+                              "tracker: ",
+                              response);
+                  continue;
+                }
+
                 std::vector<std::string> peers_list;
                 std::string peer_addr;
-                while (resp_ss >> peer_addr) {
+                std::stringstream peers_ss(response.substr(hashes_end + 1));
+                while (peers_ss >> peer_addr) {
                   peers_list.push_back(peer_addr);
                 }
                 if (peers_list.empty()) {
@@ -611,6 +653,21 @@ int main(int argc, char const* argv[]) {
                   std::string file_name = tokens[2];
                   std::string destination_path = tokens[3];
                   std::string algorithm = "rarest";
+
+                  // Refuse a second concurrent download of the same file:
+                  // the g_downloads map is keyed by file name, so a new
+                  // state would orphan the old one (both writing to the
+                  // same destination path).
+                  {
+                    std::lock_guard<std::mutex> lock(g_downloads_mutex);
+                    auto existing = g_downloads.find(file_name);
+                    if (existing != g_downloads.end() &&
+                        !existing->second->download_complete.load()) {
+                      log_message("Error: A download of '", file_name,
+                                  "' is already in progress on this client.");
+                      continue;
+                    }
+                  }
 
                   if (tokens.size() == 5) {
                     algorithm = tokens[4];
@@ -629,11 +686,29 @@ int main(int argc, char const* argv[]) {
                   for (size_t i = 0; i < all_hashes.length(); i += 40) {
                     state->piece_hashes.push_back(all_hashes.substr(i, 40));
                   }
+
+                  // Cross-check the two independent sources for the piece
+                  // count: file_size/PIECE_SIZE vs. hash entries (40 hex
+                  // chars each). A mismatch means the tracker response was
+                  // truncated or corrupted; refuse the download rather than
+                  // risk an out-of-bounds piece index later.
+                  if (state->piece_hashes.size() !=
+                      static_cast<size_t>(state->num_pieces)) {
+                    log_message(
+                        "Error: Hash count mismatch for ", file_name, " (",
+                        state->piece_hashes.size(), " hashes for ",
+                        state->num_pieces, " pieces). Tracker metadata is "
+                        "corrupt; aborting download.");
+                    continue;
+                  }
+
                   for (const auto& peer_addr : peers_list) {
                     state->peers.emplace_back(peer_addr);
                   }
                   state->pieces_we_have.assign(state->num_pieces, false);
                   state->pieces_in_progress.assign(state->num_pieces, false);
+                  state->pieces_exhausted.assign(state->num_pieces, false);
+                  state->piece_failures.assign(state->num_pieces, 0);
                   state->piece_rarity.assign(state->num_pieces, 0);
 
                   {

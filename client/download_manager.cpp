@@ -43,6 +43,15 @@ int connect_to_peer(const std::string& peer_addr) {
     close(sockfd);
     return -1;
   }
+
+  // Bound request/response I/O so a stalled peer (e.g. one that accepts the
+  // connection but never replies) cannot hang a download worker forever.
+  struct timeval io_timeout;
+  io_timeout.tv_sec = 10;
+  io_timeout.tv_usec = 0;
+  setsockopt(sockfd, SOL_SOCKET, SO_RCVTIMEO, &io_timeout, sizeof(io_timeout));
+  setsockopt(sockfd, SOL_SOCKET, SO_SNDTIMEO, &io_timeout, sizeof(io_timeout));
+
   return sockfd;
 }
 
@@ -135,25 +144,51 @@ void peer_worker(DownloadState& state, PeerState& self, int output_fd) {
       piece_ss >> header >> piece_idx_str;
 
       if (header == "PIECE") {
-        size_t data_start = header.length() + piece_idx_str.length() + 2;
-        const char* piece_data = piece_response.data() + data_start;
-        size_t data_len = piece_response.length() - data_start;
+        // Locate the payload robustly: it begins right after the second
+        // space, independent of header or index length.
+        size_t sp1 = piece_response.find(' ');
+        size_t sp2 =
+            (sp1 == std::string::npos) ? sp1
+                                       : piece_response.find(' ', sp1 + 1);
+        bool index_ok = false;
+        int received_index = -1;
+        try {
+          received_index = std::stoi(piece_idx_str);
+          index_ok = true;
+        } catch (const std::exception&) {
+        }
 
-        std::string received_hash = hash_buffer(piece_data, data_len);
-        if (received_hash == state.piece_hashes[piece_to_download]) {
-          {
-            std::lock_guard<std::mutex> file_lock(state.file_mutex);
-            long long offset = (long long)piece_to_download * PIECE_SIZE;
-            //  Using pwrite for atomic seek-and-write
-            if (pwrite(output_fd, piece_data, data_len, offset) ==
-                (ssize_t)data_len) {
-              success = true;
-            }
-          }
-          success = true;
+        if (sp2 == std::string::npos || !index_ok ||
+            received_index != piece_to_download) {
+          log_message("[Peer ", self.peer_address,
+                      "] Malformed PIECE response for piece ",
+                      piece_to_download);
         } else {
-          log_message("[Peer ", self.peer_address, "] Hash mismatch for piece ",
-                      piece_to_download, ". Retrying...");
+          size_t data_start = sp2 + 1;
+          const char* piece_data = piece_response.data() + data_start;
+          size_t data_len = piece_response.length() - data_start;
+
+          std::string received_hash = hash_buffer(piece_data, data_len);
+          if (received_hash == state.piece_hashes[piece_to_download]) {
+            {
+              std::lock_guard<std::mutex> file_lock(state.file_mutex);
+              long long offset = (long long)piece_to_download * PIECE_SIZE;
+              // pwrite for atomic seek-and-write. The piece only counts as
+              // downloaded if the full payload actually reached the disk.
+              if (pwrite(output_fd, piece_data, data_len, offset) ==
+                  (ssize_t)data_len) {
+                success = true;
+              } else {
+                log_message("[Peer ", self.peer_address,
+                            "] Short or failed write for piece ",
+                            piece_to_download);
+              }
+            }
+          } else {
+            log_message("[Peer ", self.peer_address,
+                        "] Hash mismatch for piece ", piece_to_download,
+                        ". Retrying...");
+          }
         }
       }
     } else {
@@ -173,6 +208,12 @@ void peer_worker(DownloadState& state, PeerState& self, int output_fd) {
       } else {
         // Mark as not in progress so another peer can try again
         state.pieces_in_progress[piece_to_download] = false;
+        state.piece_failures[piece_to_download]++;
+        if (state.piece_failures[piece_to_download] >= MAX_PIECE_ATTEMPTS) {
+          state.pieces_exhausted[piece_to_download] = true;
+          log_message("[Peer ", self.peer_address, "] Piece ",
+                      piece_to_download, " exhausted its retry budget.");
+        }
       }
       self.assigned_piece = -1;
     }
@@ -284,7 +325,23 @@ void start_download(std::shared_ptr<DownloadState> state) {
       lock.unlock();
       state->cv.notify_all();
     } else {
+      // No work could be assigned this pass. If nothing is in flight
+      // either, no active peer can serve any remaining piece (unavailable
+      // or exhausted) — abort instead of spinning forever.
+      bool any_in_progress = false;
+      for (bool in_prog : state->pieces_in_progress) {
+        if (in_prog) {
+          any_in_progress = true;
+          break;
+        }
+      }
       lock.unlock();
+      if (!any_in_progress) {
+        log_message(
+            "[Download Manager] No active peer can serve the remaining "
+            "pieces. Aborting download.");
+        break;
+      }
     }
 
     std::this_thread::sleep_for(std::chrono::milliseconds(100));

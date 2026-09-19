@@ -82,7 +82,17 @@ bool parse_tracker_info(const std::string& file_path,
     }
     TrackerInfo info;
     info.ip = line.substr(0, colon_pos);
-    info.port = std::stoi(line.substr(colon_pos + 1));
+    try {
+      int port = std::stoi(line.substr(colon_pos + 1));
+      if (port <= 0 || port > 65535) {
+        log_tracker("Error: Port out of range in tracker_info.txt: ", line);
+        return false;
+      }
+      info.port = port;
+    } catch (const std::exception&) {
+      log_tracker("Error: Non-numeric port in tracker_info.txt: ", line);
+      return false;
+    }
     trackers.push_back(info);
   }
   return true;
@@ -150,27 +160,33 @@ void handle_client(int client_sock, ReplicationManager& replication_manager) {
         }
       } else if (command == "login") {
         if (tokens.size() != 4) {  // Here i am also sending the port
-          response = "ERROR: Usage: login <user_id> <password>";
-        } else {
-          response = tracker_state.handle_login(tokens[1], tokens[2]);
-          if (response.rfind("SUCCESS", 0) == 0) {
-            current_user_id = tokens[1];
-            client_is_logged_in = true;
-            struct sockaddr_in addr;
-            socklen_t addr_len = sizeof(addr);
-            if (getpeername(client_sock, (struct sockaddr*)&addr, &addr_len) ==
-                0) {
-              char client_ip[INET_ADDRSTRLEN];
-              inet_ntop(AF_INET, &addr.sin_addr, client_ip, sizeof(client_ip));
-              std::string ip_port = std::string(client_ip) + ":" + tokens[3];
+          response = "ERROR: Usage: login <user_id> <password>";          } else {
+            response = tracker_state.handle_login(tokens[1], tokens[2]);
+            if (response.rfind("SUCCESS", 0) == 0) {
+              current_user_id = tokens[1];
+              client_is_logged_in = true;
+              struct sockaddr_in addr;
+              socklen_t addr_len = sizeof(addr);
+              if (getpeername(client_sock, (struct sockaddr*)&addr, &addr_len) ==
+                  0) {
+                char client_ip[INET_ADDRSTRLEN];
+                inet_ntop(AF_INET, &addr.sin_addr, client_ip, sizeof(client_ip));
+                std::string ip_port = std::string(client_ip) + ":" + tokens[3];
 
-              tracker_state.add_peer_address(current_user_id, ip_port);
-            } else {
-              perror("getpeername failed");
+                tracker_state.add_peer_address(current_user_id, ip_port);
+              } else {
+                perror("getpeername failed");
+              }
+              // Forward a placeholder port to the backup: the backup has no
+              // client socket, so it cannot learn the peer IP. Storing the
+              // port here would create the bogus address "<port>:<port>".
+              // The backup is a metadata mirror only; a newly promoted
+              // primary invalidates sessions, forcing re-login (which then
+              // publishes real addresses to the new primary).
+              replication_manager.forward_command("login " + tokens[1] + " " +
+                                                  tokens[2] + " 0");
             }
-            replication_manager.forward_command(message);
           }
-        }
       } else if (command == "logout") {
         if (tokens.size() != 1) {
           response = "ERROR: logout takes no arguments.";
@@ -190,6 +206,8 @@ void handle_client(int client_sock, ReplicationManager& replication_manager) {
           response =
               tracker_state.handle_create_group(tokens[1], current_user_id);
           if (response.rfind("SUCCESS", 0) == 0) {
+            // Forward with the owner id appended; the backup's replicated
+            // form of create_group takes <group_id> <owner_id>.
             replication_manager.forward_command(message + " " +
                                                 current_user_id);
           }
@@ -201,6 +219,8 @@ void handle_client(int client_sock, ReplicationManager& replication_manager) {
           response =
               tracker_state.handle_join_group(tokens[1], current_user_id);
           if (response.rfind("SUCCESS", 0) == 0) {
+            // Forward with the requester id appended: without it the backup
+            // never records the pending join request.
             replication_manager.forward_command(message + " " +
                                                 current_user_id);
           }
@@ -231,10 +251,28 @@ void handle_client(int client_sock, ReplicationManager& replication_manager) {
         if (tokens.size() != 5) {
           response = "ERROR: Malformed upload request.";
         } else {
-          long long file_size = std::stoll(tokens[3]);
+          long long file_size = 0;
+          try {
+            file_size = std::stoll(tokens[3]);
+          } catch (const std::exception&) {
+            response = "ERROR: File size must be an integer.";
+            log_tracker("[Client Thread] Sending response to ", client_sock,
+                        ": ", response);
+            sendMessage(client_sock, response);
+            continue;
+          }
+          if (file_size < 0) {
+            response = "ERROR: File size must be non-negative.";
+            log_tracker("[Client Thread] Sending response to ", client_sock,
+                        ": ", response);
+            sendMessage(client_sock, response);
+            continue;
+          }
           response = tracker_state.handle_upload_file(
               tokens[1], tokens[2], file_size, tokens[4], current_user_id);
           if (response.rfind("SUCCESS", 0) == 0) {
+            // Replicated form of upload_file takes the user id as the 6th
+            // token; keep forwarding the identity explicitly.
             replication_manager.forward_command(message + " " +
                                                 current_user_id);
           }
@@ -332,7 +370,13 @@ int main(int argc, char const* argv[]) {
   signal(SIGPIPE, SIG_IGN);  // Ignore SIGPIPE globally
 
   std::string tracker_info_path = argv[1];
-  int tracker_no = std::stoi(argv[2]);
+  int tracker_no = 0;
+  try {
+    tracker_no = std::stoi(argv[2]);
+  } catch (const std::exception&) {
+    log_tracker("Error: tracker_no must be an integer, got '", argv[2], "'.");
+    return 1;
+  }
 
   // Enforce single instance per tracker ID
   if (!acquire_tracker_lock(tracker_no)) {

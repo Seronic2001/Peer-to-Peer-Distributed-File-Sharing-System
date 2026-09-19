@@ -155,7 +155,18 @@ void handle_peer_connection(int peer_sock) {
       continue;
 
     if (request_tokens.size() == 2) {
-      int piece_index = std::stoi(request_tokens[1]);
+      int piece_index = -1;
+      try {
+        piece_index = std::stoi(request_tokens[1]);
+      } catch (const std::exception&) {
+        continue;  // Malformed index; ignore the request.
+      }
+      long long max_pieces = (file_size + PIECE_SIZE - 1) / PIECE_SIZE;
+      if (piece_index < 0 || piece_index >= max_pieces) {
+        log_message("[Peer Thread] Rejecting out-of-range piece request ",
+                    piece_index, " for ", file_name);
+        continue;
+      }
       int fd = open(local_path.c_str(), O_RDONLY);
       if (fd < 0)
         continue;

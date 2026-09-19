@@ -104,13 +104,14 @@ std::string build_prompt() {
 }
 
 void redraw_line() {
-  // Prompt is recomputed every redraw so a login/logout instantly recolors
-  // it. ui::visible_len() counts only visible characters, so ANSI color
-  // codes never skew the cursor arithmetic.
+  // Prompt is recomputed every redraw so a login/logout instantly recolors it.
   const std::string prompt = build_prompt();
-  const size_t prompt_width = ui::visible_len(prompt);
   std::cout << "\r\x1b[K" << prompt << current_line;
-  std::cout << "\r\x1b[" << (prompt_width + cursor_pos) << "C" << std::flush;
+  if (cursor_pos < current_line.size()) {
+    size_t back = current_line.size() - cursor_pos;
+    std::cout << "\x1b[" << back << "D";
+  }
+  std::cout << std::flush;
 }
 
 // Prints a tracker response with semantics-aware coloring: SUCCESS green,
@@ -151,6 +152,7 @@ void print_help() {
   cmd("download_file", "<group> <file> <dest> [alg]", "download [alg: rarest|sequential|random]");
   cmd("stop_share", "<group_id> <file_name>", "stop sharing a file");
   cmd("show_downloads", "", "show active and finished downloads");
+  cmd("clear", "", "clear the terminal screen");
   cmd("quit", "", "exit the client");
   log_message(ui::styled(ui::DIM,
                          "Keys: Tab complete · Up/Down history · Left/Right move · "
@@ -169,8 +171,8 @@ const std::vector<std::string>& known_commands() {
       "create_user",     "login",          "logout",           "create_group",
       "join_group",      "leave_group",    "accept_request",   "list_groups",
       "list_requests",   "list_files",     "upload_file",      "download_file",
-      "stop_share",      "show_downloads", "help",             "quit",
-      "exit",
+      "stop_share",      "show_downloads", "clear",            "help",
+      "quit",            "exit",
   };
   return cmds;
 }
@@ -759,34 +761,46 @@ int main(int argc, char const* argv[]) {
         current_line.clear();
         cursor_pos = 0;
 
+        std::stringstream ss(command_to_process);
+        std::vector<std::string> tokens;
+        std::string token;
+        while (ss >> token) {
+          tokens.push_back(token);
+        }
+        if (tokens.empty()) {
+          std::lock_guard<std::mutex> lock(cout_mutex);
+          redraw_line();
+          continue;  // Whitespace-only input.
+        }
+
         // Remember the command (dedup consecutive duplicates like bash) in
         // memory and in the history file so it survives restarts.
         record_command(command_to_process);
 
+        std::string command = tokens[0];
+
+        if (command == "clear" || command == "cls") {
+          std::lock_guard<std::mutex> lock(cout_mutex);
+          std::cout << "\x1b[2J\x1b[3J\x1b[H" << std::flush;
+          redraw_line();
+          continue;
+        }
+
         log_message(ui::styled(ui::DIM, "ran: "), command_to_process);
 
-        if (command_to_process == "quit" || command_to_process == "exit") {
+        if (command == "quit" || command == "exit") {
           exit_program = true;
           safe_exit = true;
           break;
         }
 
-        if (command_to_process == "help" || command_to_process == "?") {
+        if (command == "help" || command == "?") {
           print_help();
           continue;
         }
 
-        if (!command_to_process.empty()) {
-          std::stringstream ss(command_to_process);
-          std::vector<std::string> tokens;
-          std::string token;
-          while (ss >> token) {
-            tokens.push_back(token);
-          }
-          if (tokens.empty()) continue;  // Whitespace-only input.
-          std::string command = tokens[0];
-          bool should_send = true;
-          std::string response;
+        bool should_send = true;
+        std::string response;
 
           // Guard every per-command token access below: a malformed command
           // must print usage, never crash the CLI or skip state updates.
@@ -1112,11 +1126,7 @@ int main(int argc, char const* argv[]) {
               seeded_files.erase(file_name_to_stop);
             }
           }
-        } else {
-          std::lock_guard<std::mutex> lock(cout_mutex);
-          redraw_line();
-        }
-      } else if (c == 127) {  // Backspace
+        } else if (c == 127) {  // Backspace
         if (cursor_pos > 0) {
           current_line.erase(cursor_pos - 1, 1);
           cursor_pos--;
@@ -1224,7 +1234,7 @@ int main(int argc, char const* argv[]) {
         redraw_line();
       } else if (c == 12) {  // Ctrl+L: clear screen and repaint.
         std::lock_guard<std::mutex> lock(cout_mutex);
-        std::cout << "\x1b[2J\x1b[H" << std::flush;
+        std::cout << "\x1b[2J\x1b[3J\x1b[H" << std::flush;
         redraw_line();
       } else if (!iscntrl(c)) {
         current_line.insert(cursor_pos, 1, c);

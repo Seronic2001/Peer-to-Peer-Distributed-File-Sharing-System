@@ -89,7 +89,7 @@ prompt (dim `anon@p2p` until you log in), with full line editing:
 * Command history persists across runs in
   `~/.p2p_client_history` (deduplicated, capped at 200 entries), so `↑`
   still recalls commands from previous sessions.
-* `Ctrl+L` clears the screen; type `help` for the command list.
+* `Ctrl+L` (or typing `clear`) clears the screen; type `help` for the command list.
 
 Malformed commands, unknown commands, and tracker errors are reported in red
 without ever crashing the client or corrupting the input line.

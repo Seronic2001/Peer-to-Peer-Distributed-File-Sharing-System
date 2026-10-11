@@ -1,82 +1,62 @@
 #include <algorithm>
-#include <chrono>
 #include <random>
-#include <vector>
 
 #include "include/piece_selector.h"
 
-int RarestFirstSelector::select_piece(DownloadState& state) {
+namespace {
+
+// Number of piece indices that are safe to inspect for this peer.
+int candidate_range(const DownloadState& state, const PeerState& peer) {
+  if (!peer.is_active)
+    return 0;
+  return std::min<size_t>(state.num_pieces, peer.bitfield.size());
+}
+
+// A piece is a candidate if we still need it, no other worker is fetching
+// it, and this peer has it.
+bool is_candidate(const DownloadState& state, const PeerState& peer, int i) {
+  return !state.pieces_we_have[i] && !state.pieces_in_progress[i] &&
+         peer.bitfield[i];
+}
+
+}  // namespace
+
+int RarestFirstSelector::select_piece(const DownloadState& state,
+                                      const PeerState& peer) {
   int best_piece = -1;
-  // Initialize with a value higher than any possible rarity
-  int min_rarity = state.peers.size() + 1;
-
-  // Find the rarest piece that we don't have and isn't already in progress.
-  for (int i = 0; i < state.num_pieces; ++i) {
-    if (!state.pieces_we_have[i] && !state.pieces_in_progress[i] &&
-        !state.pieces_exhausted[i]) {
-      // Check if this piece is rarer than the best one we've found so far.
-      if (state.piece_rarity[i] < min_rarity) {
-        // Ensure at least one of our active peers actually has this piece.
-        bool is_available = false;
-        for (const auto& p : state.peers) {
-          if (p.is_active && p.bitfield.size() > (size_t)i && p.bitfield[i]) {
-            is_available = true;
-            break;
-          }
-        }
-
-        if (is_available) {
-          min_rarity = state.piece_rarity[i];
-          best_piece = i;
-        }
-      }
+  const int n = candidate_range(state, peer);
+  for (int i = 0; i < n; ++i) {
+    if (is_candidate(state, peer, i) &&
+        (best_piece == -1 ||
+         state.piece_rarity[i] < state.piece_rarity[best_piece])) {
+      best_piece = i;
     }
   }
   return best_piece;
 }
 
-int SequentialSelector::select_piece(DownloadState& state) {
-  // Find the first piece we don't have and that isn't in progress.
-  for (int i = 0; i < state.num_pieces; ++i) {
-    if (!state.pieces_we_have[i] && !state.pieces_in_progress[i] &&
-        !state.pieces_exhausted[i]) {
-      // Check if any of our active peers have this piece.
-      for (const auto& p : state.peers) {
-        if (p.is_active && p.bitfield.size() > (size_t)i && p.bitfield[i]) {
-          // This is a valid piece to download.
-          return i;
-        }
-      }
-    }
+int SequentialSelector::select_piece(const DownloadState& state,
+                                     const PeerState& peer) {
+  const int n = candidate_range(state, peer);
+  for (int i = 0; i < n; ++i) {
+    if (is_candidate(state, peer, i))
+      return i;
   }
-  // No suitable piece was found.
   return -1;
 }
 
-int RandomSelector::select_piece(DownloadState& state) {
-  std::vector<int> available_pieces;
-  // Find all pieces we need and that are available from at least one peer.
-  for (int i = 0; i < state.num_pieces; ++i) {
-    if (!state.pieces_we_have[i] && !state.pieces_in_progress[i] &&
-        !state.pieces_exhausted[i]) {
-      for (const auto& p : state.peers) {
-        if (p.is_active && p.bitfield.size() > (size_t)i && p.bitfield[i]) {
-          available_pieces.push_back(i);
-          break;  // Move to the next piece once we know it's available
-        }
-      }
-    }
+int RandomSelector::select_piece(const DownloadState& state,
+                                 const PeerState& peer) {
+  // Reservoir sampling: one pass, uniform over the candidates, no allocation.
+  int chosen = -1;
+  int seen = 0;
+  const int n = candidate_range(state, peer);
+  for (int i = 0; i < n; ++i) {
+    if (!is_candidate(state, peer, i))
+      continue;
+    ++seen;
+    if (std::uniform_int_distribution<int>(1, seen)(rng) == 1)
+      chosen = i;
   }
-
-  if (available_pieces.empty()) {
-    return -1;  // No pieces to download
-  }
-
-  // Shuffle the list of available pieces and return the first one.
-  unsigned seed =
-      std::chrono::high_resolution_clock::now().time_since_epoch().count();
-  std::shuffle(available_pieces.begin(), available_pieces.end(),
-               std::default_random_engine(seed));
-
-  return available_pieces[0];
+  return chosen;
 }

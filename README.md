@@ -34,7 +34,7 @@ The system is composed of two primary components:
 * **Partial Seeding:** A client can begin uploading pieces it has already downloaded to other peers, even before its own download is 100% complete.
 * **File Integrity:** All files and file pieces are verified using **SHA1 hashes** to ensure data is not corrupted during transfer.
 * **Robust Concurrency:** The system is heavily multi-threaded and uses thread-safe data structures and synchronization primitives (`std::mutex`, `std::condition_variable`) to handle concurrent operations safely and efficiently.
-* **Tested:** A dependency-free unit test suite (48 tests, runs under AddressSanitizer + UBSan) plus an end-to-end integration harness covering real transfers, tracker failover, and corrupt-peer resilience. See [Testing](#9-testing).
+* **Tested:** A dependency-free unit test suite (46 tests, runs under AddressSanitizer + UBSan) plus an end-to-end integration harness covering real transfers, tracker failover, and corrupt-peer resilience. See [Testing](#9-testing).
 
 ---
 
@@ -44,13 +44,14 @@ The system is composed of two primary components:
 The project uses a standard Makefile with two build modes:
 
 ```bash
-$ make            # release build: -O2, verbose logging compiled out
-$ make debug      # debug build: -g -O0 + P2P_DEBUG, full per-command logging
+$ make            # debug build (default): -g, full per-command logging
+$ make release    # release build: -O2, verbose logging compiled out
 ```
 
-Both modes produce `./tracker/tracker` and `./client/client`. They use separate
-object directories (`build/` vs `build/debug/`), so you can switch between them
-without a clean.
+The debug build produces `./tracker/tracker` and `./client/client`; the release
+build produces `./tracker/tracker-release` and `./client/client-release`. They
+use separate object directories (`build/` vs `build_release/`), so you can
+switch between them without a clean.
 
 **Logging:** all log output is leveled and colored. `ERROR`/`WARN`/important
 events always print; per-command `DEBUG` chatter is compiled out of release
@@ -102,9 +103,9 @@ without ever crashing the client or corrupting the input line.
 
 #### Synchronization Model: Primary-Backup
 To achieve fault tolerance, a Primary-Backup model was implemented:
-1.  **Role Election:** On startup, each tracker attempts to connect to the other on a dedicated replication port. The first one to start fails to connect and assumes the **Primary** role. The second tracker connects successfully and assumes the **Backup** role.
-2.  **State Replication:** The Primary handles all client interactions. For any state-changing command (e.g., `create_user`), it forwards the command string to the Backup, which applies the same change to its in-memory state.
-3.  **Failover:** If the Backup loses its connection to the Primary, it promotes itself to Primary and begins accepting client connections. It also invalidates all user sessions, forcing clients to re-login to ensure a consistent state.
+1.  **Role Election:** On startup, each tracker connects to the other on a dedicated replication port. Only a Primary accepts that connection, and it answers at once with a full copy of its state. A tracker that cannot connect assumes the **Primary** role; one that receives the state becomes the **Backup**. If both start together, each hears only silence from the other, and the lower-numbered tracker takes the Primary role while the other retries.
+2.  **State Replication:** The Primary handles all client interactions. A Backup receives the full state when it connects. After that, for any state-changing command (e.g., `create_user`), the Primary forwards the command string to the Backup, which applies the same change to its in-memory state. Login sessions and peer addresses are not replicated.
+3.  **Failover:** The Primary sends a heartbeat every 2 seconds. If the Backup loses its connection, or hears nothing for 6 seconds, it tries to reconnect; if the Primary is unreachable or stays silent, the Backup promotes itself and begins accepting client connections. A newly promoted Primary starts with no user sessions, forcing clients to re-login to ensure a consistent state.
 
 #### Data Structures
 * `std::unordered_map` is used for primary data containers (`users`, `groups`, `files`) for its efficient average-case O(1) time complexity for lookups.
@@ -112,14 +113,15 @@ To achieve fault tolerance, a Primary-Backup model was implemented:
 
 ### Client System
 
-#### Threading Model: Producer-Consumer
-The client download process is built on a multi-threaded producer-consumer pattern:
-* **Download Manager (Producer):** A dedicated thread that orchestrates the download. It selects pieces to download using the chosen strategy and assigns them as "work" to idle Peer Worker threads.
-* **Peer Workers (Consumers):** One thread per peer connection. Each worker waits on a condition variable. When assigned a piece by the manager, it wakes up, downloads the piece, verifies its hash, and writes it to disk. Upon completion, it signals the manager that it is idle and ready for more work.
+#### Threading Model: Self-Scheduling Workers
+Each download runs one worker thread per peer connection, sharing a single `DownloadState`:
+* **Peer Workers:** Under the state lock, a worker asks the chosen strategy for the next piece that its peer has and nobody else is fetching, and marks it in progress. It then releases the lock, downloads the piece, verifies its hash, and writes it to disk with `pwrite`. A worker with nothing to pick waits on a condition variable while pieces it could serve are still in flight elsewhere, and exits when its peer has nothing left to offer.
+* **Failure handling:** A peer whose connection fails is dropped immediately. A piece that fails verification is never requested from that peer again, and a peer that fails three pieces in a row is dropped.
+* **Download Manager:** The download thread starts the workers and waits for them. The download succeeded if every piece was verified and written; the main thread then reports the result to the tracker.
 
 #### State Management & Seeding
 * The client creates a hidden `.p2p_client/` directory in the user's home folder to store persistent metadata.
-* For each shared file, a `.meta` file is created containing the absolute path to the original file.
+* For each fully available file (uploaded, or downloaded to completion), a `.meta` file is created containing its group, name, size and the absolute path to the file.
 * **Seeding is path-dependent.** The client reads directly from the original file path to serve pieces to other peers. If the user moves, renames, or deletes a file after sharing it, seeding for that file will fail.
 
 ---
@@ -135,7 +137,7 @@ download_file <group_id> <file_name> <dest_path> [rarest|sequential|random]
 #### Rarest-First Algorithm
 The default and most effective strategy is Rarest-First.
 1.  **Data Collection:** As the client connects to peers, it builds a real-time census of which pieces are available on which peers. This is stored in a `piece_rarity` vector where each index holds the count of peers who have that piece.
-2.  **Selection Logic:** When choosing a piece to download, the manager selects the piece that it doesn't have, is not currently in progress, and has the **lowest count** in the `piece_rarity` vector. This prioritizes pieces that are in danger of disappearing from the swarm.
+2.  **Selection Logic:** When a worker chooses a piece to request from its peer, it selects the piece that the peer has, that the client doesn't have, is not currently in progress, and has the **lowest count** in the `piece_rarity` vector. This prioritizes pieces that are in danger of disappearing from the swarm.
 
 ### Synergistic Swarm Efficiency
 The system's true power comes from the synergy between two features:
@@ -159,7 +161,7 @@ All communication occurs over TCP sockets using a custom, length-prefixed protoc
 * **Response Format:** `SUCCESS: <message>` or `ERROR: <message>`
 
 ### Client-Peer Protocol
-* `HANDSHAKE <file_name>`
+* `HANDSHAKE <group_id> <file_name>`
 * `BITFIELD <011010...>`
 * `REQUEST_PIECE <piece_index>`
 * `PIECE <piece_index> <binary_data>`
@@ -187,7 +189,7 @@ only the objects it exercises, so failures isolate the offending module:
 | `test_protocol` | Length-prefixed framing: round-trips, binary payloads with NUL bytes, >1 MB messages through the partial send/recv loops, message coalescing, `EINTR` retries, oversized-prefix rejection, send/recv on closed sockets |
 | `test_hashing` | SHA-1 known-answer vectors, piece boundaries (exact multiples, partial final piece, empty file), missing-file error |
 | `test_tracker_state` | User/group/file semantics, owner promotion, leecher lifecycle, replication replay equivalence (backup state must match primary), malformed/controlled-command tolerance, `FULL_STATE_SYNC` rebuild |
-| `test_download_logic` | Piece-selection strategies: rarest-first ordering, availability filtering, exhausted-piece skipping, sequential and random validity, empty-state handling |
+| `test_download_logic` | Piece-selection strategies: rarest-first ordering, per-peer availability filtering, sequential and random validity, inactive-peer and empty-file handling |
 
 ### Integration tests (`tests/integration_test.sh`)
 Boots the real topology (2 trackers + clients driven through stdin FIFOs) and

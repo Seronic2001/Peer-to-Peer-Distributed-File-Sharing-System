@@ -1,8 +1,9 @@
 #include <fcntl.h>
-#include <sys/stat.h>
 #include <unistd.h>
 
+#include <cerrno>
 #include <iomanip>
+#include <sstream>
 #include <stdexcept>
 #include <vector>
 
@@ -44,44 +45,36 @@ FileHashes compute_hashes(const std::string& file_path) {
   }
 
   FileHashes result;
-
-  // Get file size
-  struct stat file_stat;
-  if (fstat(fd, &file_stat) < 0) {
-    close(fd);
-    throw std::runtime_error("Could not get size of file " + file_path);
-  }
-  result.file_size = file_stat.st_size;
-
-  // Context for the full file hash
-  EVP_MD_CTX* md_ctx_full = EVP_MD_CTX_new();
-  if (!md_ctx_full) {
-    throw std::runtime_error("Failed to create EVP_MD_CTX for full file hash");
-  }
-  EVP_DigestInit_ex(md_ctx_full, EVP_sha1(), NULL);
-
+  result.file_size = 0;
   std::vector<char> buffer(PIECE_SIZE);
-  ssize_t bytes_read;
 
-  // Read the file piece by piece in a loop using read()
-  while ((bytes_read = read(fd, buffer.data(), PIECE_SIZE)) > 0) {
-    // Update the full file hash with the chunk we just read
-    EVP_DigestUpdate(md_ctx_full, buffer.data(), bytes_read);
+  // Read the file piece by piece. A piece is only short at end of file, so
+  // keep reading until the buffer is full or read() reports EOF.
+  while (true) {
+    size_t filled = 0;
+    while (filled < buffer.size()) {
+      ssize_t n = read(fd, buffer.data() + filled, buffer.size() - filled);
+      if (n < 0) {
+        if (errno == EINTR)
+          continue;
+        close(fd);
+        throw std::runtime_error("Could not read file " + file_path);
+      }
+      if (n == 0)
+        break;
+      filled += static_cast<size_t>(n);
+    }
+    if (filled == 0)
+      break;
 
-    // Compute the hash for this specific piece
-    std::string piece_hash_str = hash_buffer(buffer.data(), bytes_read);
+    std::string piece_hash_str = hash_buffer(buffer.data(), filled);
     result.piece_hashes.push_back(piece_hash_str);
     result.concatenated_hashes += piece_hash_str;
+    result.file_size += static_cast<long long>(filled);
+    if (filled < buffer.size())
+      break;
   }
 
-  // Finalize the full file hash
-  unsigned char full_digest[EVP_MAX_MD_SIZE];
-  unsigned int digest_len;
-  EVP_DigestFinal_ex(md_ctx_full, full_digest, &digest_len);
-  result.full_file_hash = to_hex_string(full_digest, digest_len);
-
-  EVP_MD_CTX_free(md_ctx_full);
   close(fd);
-
   return result;
 }

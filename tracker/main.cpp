@@ -11,6 +11,7 @@
 #include <sstream>
 #include <string>
 #include <thread>
+#include <unordered_map>
 #include <vector>
 
 #include "include/replication_manager.h"
@@ -109,6 +110,181 @@ void console_handler() {
   }
 }
 
+using Tokens = std::vector<std::string>;
+
+// A command available to a logged-in client.
+struct CommandSpec {
+  size_t num_tokens;  // Command name plus its arguments.
+  const char* usage;
+  // State-changing commands are forwarded to the backup on success, with the
+  // acting user's id appended as the last token.
+  bool replicate;
+  std::string (*run)(const Tokens& tokens, const std::string& user_id);
+};
+
+const std::unordered_map<std::string, CommandSpec>& session_commands() {
+  static const std::unordered_map<std::string, CommandSpec> commands = {
+      {"create_group",
+       {2, "create_group <group_id>", true,
+        [](const Tokens& t, const std::string& user) {
+          return tracker_state.handle_create_group(t[1], user);
+        }}},
+      {"join_group",
+       {2, "join_group <group_id>", true,
+        [](const Tokens& t, const std::string& user) {
+          return tracker_state.handle_join_group(t[1], user);
+        }}},
+      {"leave_group",
+       {2, "leave_group <group_id>", true,
+        [](const Tokens& t, const std::string& user) {
+          return tracker_state.handle_leave_group(t[1], user);
+        }}},
+      {"accept_request",
+       {3, "accept_request <group_id> <user_id>", true,
+        [](const Tokens& t, const std::string& user) {
+          return tracker_state.handle_accept_request(t[1], t[2], user);
+        }}},
+      {"upload_file",
+       {5, "upload_file <group_id> <file_name> <file_size> <hashes>", true,
+        [](const Tokens& t, const std::string& user) {
+          long long file_size = -1;
+          try {
+            file_size = std::stoll(t[3]);
+          } catch (const std::exception&) {
+          }
+          if (file_size < 0) {
+            return std::string(
+                "ERROR: File size must be a non-negative integer.");
+          }
+          return tracker_state.handle_upload_file(t[1], t[2], file_size, t[4],
+                                                  user);
+        }}},
+      {"stop_share",
+       {3, "stop_share <group_id> <file_name>", true,
+        [](const Tokens& t, const std::string& user) {
+          return tracker_state.handle_stop_share(t[1], t[2], user);
+        }}},
+      {"start_downloading",
+       {3, "start_downloading <group_id> <file_name>", true,
+        [](const Tokens& t, const std::string& user) {
+          return tracker_state.handle_start_downloading(t[1], t[2], user);
+        }}},
+      {"stop_leeching",
+       {3, "stop_leeching <group_id> <file_name>", true,
+        [](const Tokens& t, const std::string& user) {
+          return tracker_state.handle_stop_leeching(t[1], t[2], user);
+        }}},
+      {"list_groups",
+       {1, "list_groups", false,
+        [](const Tokens&, const std::string&) {
+          return tracker_state.handle_list_groups();
+        }}},
+      {"list_requests",
+       {2, "list_requests <group_id>", false,
+        [](const Tokens& t, const std::string& user) {
+          return tracker_state.handle_list_requests(t[1], user);
+        }}},
+      {"list_files",
+       {2, "list_files <group_id>", false,
+        [](const Tokens& t, const std::string&) {
+          return tracker_state.handle_list_files(t[1]);
+        }}},
+      {"download_file",
+       {3, "download_file <group_id> <file_name>", false,
+        [](const Tokens& t, const std::string& user) {
+          return tracker_state.handle_download_file(t[1], t[2], user);
+        }}},
+  };
+  return commands;
+}
+
+bool is_success(const std::string& response) {
+  return response.rfind("SUCCESS", 0) == 0;
+}
+
+// A peer port as sent with login: decimal digits in the range 1-65535.
+bool is_valid_port(const std::string& port) {
+  if (port.empty() || port.size() > 5 ||
+      port.find_first_not_of("0123456789") != std::string::npos) {
+    return false;
+  }
+  int value = std::stoi(port);
+  return value > 0 && value <= 65535;
+}
+
+// Runs one client command and returns the response. `current_user_id` is the
+// connection's session: empty until a successful login.
+std::string run_client_command(int client_sock,
+                               const std::string& message,
+                               const Tokens& tokens,
+                               std::string& current_user_id,
+                               ReplicationManager& replication_manager) {
+  const std::string& command = tokens[0];
+
+  if (command == "create_user") {
+    if (tokens.size() != 3) {
+      return "ERROR: Usage: create_user <user_id> <password>";
+    }
+    std::string response =
+        tracker_state.handle_create_user(tokens[1], tokens[2]);
+    if (is_success(response)) {
+      replication_manager.forward_command(message);
+    }
+    return response;
+  }
+
+  if (command == "login") {
+    if (!current_user_id.empty()) {
+      return "ERROR: A user is already logged in on this connection.";
+    }
+    // The client appends its peer port as the fourth token.
+    if (tokens.size() != 4 || !is_valid_port(tokens[3])) {
+      return "ERROR: Usage: login <user_id> <password>";
+    }
+    struct sockaddr_in addr;
+    socklen_t addr_len = sizeof(addr);
+    char client_ip[INET_ADDRSTRLEN];
+    if (getpeername(client_sock, (struct sockaddr*)&addr, &addr_len) != 0 ||
+        !inet_ntop(AF_INET, &addr.sin_addr, client_ip, sizeof(client_ip))) {
+      return "ERROR: Could not determine your address.";
+    }
+    std::string response = tracker_state.handle_login(tokens[1], tokens[2]);
+    if (is_success(response)) {
+      current_user_id = tokens[1];
+      tracker_state.add_peer_address(
+          current_user_id, std::string(client_ip) + ":" + tokens[3]);
+    }
+    return response;
+  }
+
+  if (current_user_id.empty()) {
+    return "ERROR: You must be logged in to perform this action.";
+  }
+
+  if (command == "logout") {
+    if (tokens.size() != 1) {
+      return "ERROR: logout takes no arguments.";
+    }
+    std::string response = tracker_state.handle_logout(current_user_id);
+    current_user_id.clear();
+    return response;
+  }
+
+  auto it = session_commands().find(command);
+  if (it == session_commands().end()) {
+    return "ERROR: Unknown command '" + command + "'";
+  }
+  const CommandSpec& spec = it->second;
+  if (tokens.size() != spec.num_tokens) {
+    return std::string("ERROR: Usage: ") + spec.usage;
+  }
+  std::string response = spec.run(tokens, current_user_id);
+  if (spec.replicate && is_success(response)) {
+    replication_manager.forward_command(message + " " + current_user_id);
+  }
+  return response;
+}
+
 // Handles all communication with a single connected client.
 void handle_client(int client_sock, ReplicationManager& replication_manager) {
   if (replication_manager.is_primary_()) {
@@ -124,239 +300,32 @@ void handle_client(int client_sock, ReplicationManager& replication_manager) {
                     client_sock);
 
   std::string current_user_id;
-  bool client_is_logged_in = false;
-
   std::string message;
   while (receiveMessage(client_sock, message)) {
     log_tracker_debug("[Client Thread] Received from ", client_sock, ": ",
                       message);
 
     std::stringstream ss(message);
-    std::vector<std::string> tokens;
+    Tokens tokens;
     std::string token;
     while (ss >> token) {
       tokens.push_back(token);
     }
-
-    if (tokens.empty())
-      continue;
-
-    std::string command = tokens[0];
-    std::string response;
-
-    if (command == "login" && client_is_logged_in) {
-      response = "ERROR: A user is already logged in on this connection.";
-    } else if (command != "create_user" && command != "login" &&
-               current_user_id.empty()) {
-      response = "ERROR: You must be logged in to perform this action.";
-    } else {
-      // Command Handling
-      if (command == "create_user") {
-        if (tokens.size() != 3) {
-          response = "ERROR: Usage: create_user <user_id> <password>";
-        } else {
-          response = tracker_state.handle_create_user(tokens[1], tokens[2]);
-          if (response.rfind("SUCCESS", 0) == 0) {
-            replication_manager.forward_command(message);
-          }
-        }
-      } else if (command == "login") {
-        if (tokens.size() != 4) {  // Here i am also sending the port
-          response = "ERROR: Usage: login <user_id> <password>";          } else {
-            response = tracker_state.handle_login(tokens[1], tokens[2]);
-            if (response.rfind("SUCCESS", 0) == 0) {
-              current_user_id = tokens[1];
-              client_is_logged_in = true;
-              struct sockaddr_in addr;
-              socklen_t addr_len = sizeof(addr);
-              if (getpeername(client_sock, (struct sockaddr*)&addr, &addr_len) ==
-                  0) {
-                char client_ip[INET_ADDRSTRLEN];
-                inet_ntop(AF_INET, &addr.sin_addr, client_ip, sizeof(client_ip));
-                std::string ip_port = std::string(client_ip) + ":" + tokens[3];
-
-                tracker_state.add_peer_address(current_user_id, ip_port);
-              } else {
-                perror("getpeername failed");
-              }
-              // Forward a placeholder port to the backup: the backup has no
-              // client socket, so it cannot learn the peer IP. Storing the
-              // port here would create the bogus address "<port>:<port>".
-              // The backup is a metadata mirror only; a newly promoted
-              // primary invalidates sessions, forcing re-login (which then
-              // publishes real addresses to the new primary).
-              replication_manager.forward_command("login " + tokens[1] + " " +
-                                                  tokens[2] + " 0");
-            }
-          }
-      } else if (command == "logout") {
-        if (tokens.size() != 1) {
-          response = "ERROR: logout takes no arguments.";
-        } else {
-          response = tracker_state.handle_logout(current_user_id);
-          if (response.rfind("SUCCESS", 0) == 0) {
-            replication_manager.forward_command(command + " " +
-                                                current_user_id);
-            current_user_id.clear();
-            client_is_logged_in = false;
-          }
-        }
-      } else if (command == "create_group") {
-        if (tokens.size() != 2) {
-          response = "ERROR: Usage: create_group <group_id>";
-        } else {
-          response =
-              tracker_state.handle_create_group(tokens[1], current_user_id);
-          if (response.rfind("SUCCESS", 0) == 0) {
-            // Forward with the owner id appended; the backup's replicated
-            // form of create_group takes <group_id> <owner_id>.
-            replication_manager.forward_command(message + " " +
-                                                current_user_id);
-          }
-        }
-      } else if (command == "join_group") {
-        if (tokens.size() != 2) {
-          response = "ERROR: Usage: join_group <group_id>";
-        } else {
-          response =
-              tracker_state.handle_join_group(tokens[1], current_user_id);
-          if (response.rfind("SUCCESS", 0) == 0) {
-            // Forward with the requester id appended: without it the backup
-            // never records the pending join request.
-            replication_manager.forward_command(message + " " +
-                                                current_user_id);
-          }
-        }
-      } else if (command == "leave_group") {
-        if (tokens.size() != 2) {
-          response = "ERROR: Usage: leave_group <group_id>";
-        } else {
-          response =
-              tracker_state.handle_leave_group(tokens[1], current_user_id);
-          if (response.rfind("SUCCESS", 0) == 0) {
-            replication_manager.forward_command(message + " " +
-                                                current_user_id);
-          }
-        }
-      } else if (command == "accept_request") {
-        if (tokens.size() != 3) {
-          response = "ERROR: Usage: accept_request <group_id> <user_id>";
-        } else {
-          response = tracker_state.handle_accept_request(tokens[1], tokens[2],
-                                                         current_user_id);
-          if (response.rfind("SUCCESS", 0) == 0) {
-            replication_manager.forward_command(message + " " +
-                                                current_user_id);
-          }
-        }
-      } else if (command == "upload_file") {
-        if (tokens.size() != 5) {
-          response = "ERROR: Malformed upload request.";
-        } else {
-          long long file_size = 0;
-          try {
-            file_size = std::stoll(tokens[3]);
-          } catch (const std::exception&) {
-            response = "ERROR: File size must be an integer.";
-            log_tracker_debug("[Client Thread] Sending response to ",
-                              client_sock, ": ", response);
-            sendMessage(client_sock, response);
-            continue;
-          }
-          if (file_size < 0) {
-            response = "ERROR: File size must be non-negative.";
-            log_tracker_debug("[Client Thread] Sending response to ",
-                              client_sock, ": ", response);
-            sendMessage(client_sock, response);
-            continue;
-          }
-          response = tracker_state.handle_upload_file(
-              tokens[1], tokens[2], file_size, tokens[4], current_user_id);
-          if (response.rfind("SUCCESS", 0) == 0) {
-            // Replicated form of upload_file takes the user id as the 6th
-            // token; keep forwarding the identity explicitly.
-            replication_manager.forward_command(message + " " +
-                                                current_user_id);
-          }
-        }
-      } else if (command == "stop_share") {
-        if (tokens.size() != 3) {
-          response = "ERROR: Usage: stop_share <group_id> <file_name>";
-        } else {
-          response = tracker_state.handle_stop_share(tokens[1], tokens[2],
-                                                     current_user_id);
-          if (response.rfind("SUCCESS", 0) == 0) {
-            replication_manager.forward_command(message + " " +
-                                                current_user_id);
-          }
-        }
-      } else if (command == "start_downloading") {
-        if (tokens.size() != 3) {
-          response = "ERROR: Usage: start_downloading <group_id> <file_name>";
-        } else {
-          response = tracker_state.handle_start_downloading(
-              tokens[1], tokens[2], current_user_id);
-          if (response.rfind("SUCCESS", 0) == 0) {
-            replication_manager.forward_command(message + " " +
-                                                current_user_id);
-          }
-        }
-      } else if (command == "stop_leeching") {
-        if (tokens.size() != 3) {
-          response = "ERROR: Usage: stop_leeching <group_id> <file_name>";
-        } else {
-          response = tracker_state.handle_stop_leeching(tokens[1], tokens[2],
-                                                        current_user_id);
-          if (response.rfind("SUCCESS", 0) == 0) {
-            replication_manager.forward_command(message + " " +
-                                                current_user_id);
-          }
-        }
-      }
-      // Read-only commands
-      else if (command == "list_groups") {
-        if (tokens.size() != 1) {
-          response = "ERROR: list_groups takes no arguments.";
-        } else {
-          response = tracker_state.handle_list_groups();
-        }
-      } else if (command == "list_requests") {
-        if (tokens.size() != 2) {
-          response = "ERROR: Usage: list_requests <group_id>";
-        } else {
-          response =
-              tracker_state.handle_list_requests(tokens[1], current_user_id);
-        }
-      } else if (command == "list_files") {
-        if (tokens.size() != 2) {
-          response = "ERROR: Usage: list_files <group_id>";
-        } else {
-          response = tracker_state.handle_list_files(tokens[1]);
-        }
-      } else if (command == "download_file") {
-        if (tokens.size() < 3) {
-          response =
-              "ERROR: Incorrect number of arguments for download_file "
-              "command.";
-        } else {
-          response = tracker_state.handle_download_file(tokens[1], tokens[2],
-                                                        current_user_id);
-        }
-      } else {
-        response = "ERROR: Unknown command '" + command + "'";
-      }
-    }
+    // Every message gets exactly one response; clients rely on that.
+    std::string response =
+        tokens.empty() ? "ERROR: Empty command."
+                       : run_client_command(client_sock, message, tokens,
+                                            current_user_id,
+                                            replication_manager);
 
     log_tracker_debug("[Client Thread] Sending response to ", client_sock,
                       ": ", response);
     sendMessage(client_sock, response);
   }
 
-  if (client_is_logged_in && !current_user_id.empty()) {
+  if (!current_user_id.empty()) {
     log_tracker("[Client Thread] Client disconnected: ", current_user_id);
     tracker_state.handle_logout(current_user_id);
-    std::string logout_cmd = "logout " + current_user_id;
-    replication_manager.forward_command(logout_cmd);
   } else {
     log_tracker("[Client Thread] Client disconnected: socket ", client_sock);
   }
@@ -415,8 +384,7 @@ int main(int argc, char const* argv[]) {
   struct sockaddr_in address;
   int opt = 1;
   socklen_t addrlen = sizeof(address);
-  setsockopt(server_fd, SOL_SOCKET, SO_REUSEADDR | SO_REUSEPORT, &opt,
-             sizeof(opt));
+  setsockopt(server_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
   address.sin_family = AF_INET;
   address.sin_addr.s_addr = INADDR_ANY;
   address.sin_port = htons(my_info.port);

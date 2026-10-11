@@ -2,6 +2,7 @@
 #include <arpa/inet.h>
 #include <netinet/in.h>
 #include <sys/socket.h>
+#include <sys/time.h>
 #include <unistd.h>
 #include <cerrno>
 #include <chrono>
@@ -13,18 +14,39 @@
 #include "include/tracker_state.h"
 #include "protocol.h"
 
+// Protocol on the replication port (client port + 1000): a PRIMARY accepts
+// the connection and immediately sends "FULL_STATE_SYNC\n<state>", followed
+// by forwarded commands and a HEARTBEAT every 2 seconds. A tracker that is
+// not primary accepts nothing, so whoever connects to it hears silence. That
+// silence is what tells two trackers starting together that neither of them
+// is primary yet.
+namespace {
+
+const int HEARTBEAT_INTERVAL_SEC = 2;
+// How long a tracker waits for the other side's first message before
+// concluding that it is not a primary.
+const int ROLE_WAIT_SEC = 2;
+// A backup gives up on a primary that misses three heartbeats.
+const int PRIMARY_SILENCE_SEC = 3 * HEARTBEAT_INTERVAL_SEC;
+
+void set_io_timeout(int sock, int optname, int seconds) {
+  struct timeval timeout;
+  timeout.tv_sec = seconds;
+  timeout.tv_usec = 0;
+  setsockopt(sock, SOL_SOCKET, optname, &timeout, sizeof(timeout));
+}
+
+}  // namespace
+
 ReplicationManager::ReplicationManager(int self_id,
                                        const std::vector<TrackerInfo>& trackers,
                                        TrackerState& state)
-    : self_id(self_id), state(state), trackers_ref(trackers),
-      should_stop(false) {
+    : self_id(self_id), other_id(self_id == 1 ? 2 : 1), state(state),
+      has_other_tracker(trackers.size() > 1), should_stop(false) {
   self_info = trackers[self_id - 1];
-  // With a single tracker there is no peer: index 1 would be OUT OF BOUNDS
-  // (previously crashed with bad_alloc on corrupt string assignment). Point
-  // other_tracker_info at ourselves as a placeholder; the election loop in
-  // run() checks trackers.size() and skips probing entirely in that case.
-  const size_t other_idx = (self_id == 1) ? 1 : 0;
-  other_tracker_info = trackers[trackers.size() > 1 ? other_idx : 0];
+  // With a single tracker there is no peer; other_tracker_info is then an
+  // unused placeholder.
+  other_tracker_info = trackers[has_other_tracker ? other_id - 1 : 0];
   is_primary = false;  // Start undecided, election will decide
 }
 
@@ -48,36 +70,21 @@ bool ReplicationManager::is_primary_() const {
 }
 
 void ReplicationManager::forward_command(const std::string& command_str) {
-  log_tracker("[Replication] Attempting to forward: ", command_str);
-
   std::lock_guard<std::mutex> lock(replication_mutex);
-
-  // Always enqueue the command
-  command_queue.push_back(command_str);
-
-  // Cap queue size
-  if (command_queue.size() > 1000) {
-    log_tracker("[Replication] Command queue too large. Forcing full resync.");
-    command_queue.clear();
-    // Instead of commands, rely on next FULL_STATE_SYNC
-    return;
+  if (backup_sock < 0) {
+    return;  // No backup: it gets the full state when it connects.
   }
-
-  if (is_primary && backup_sock >= 0) {
-    if (!sendMessage(backup_sock, command_str)) {
-      log_tracker("[Replication] Failed to forward command, keeping in queue: ",
-                  command_str);
-      close(backup_sock);
-      backup_sock = -1;
-    }
-  } else if (is_primary) {
-    log_tracker("[Replication] Queued command (backup not connected): ",
-                command_str);
+  log_tracker_debug("[Replication] Forwarding: ", command_str);
+  if (!sendMessage(backup_sock, command_str)) {
+    log_tracker("[Replication] Backup disconnected. Will wait for reconnect.");
+    close(backup_sock);
+    backup_sock = -1;
   }
 }
 
 void ReplicationManager::run() {
-  // Start a listener for replication (always)
+  // The replication listener exists in every role, but only a primary
+  // accepts connections on it.
   int listener_fd = socket(AF_INET, SOCK_STREAM, 0);
   struct sockaddr_in address;
   address.sin_family = AF_INET;
@@ -85,48 +92,27 @@ void ReplicationManager::run() {
   address.sin_port = htons(self_info.port + 1000);
 
   int opt = 1;
-  setsockopt(listener_fd, SOL_SOCKET, SO_REUSEADDR | SO_REUSEPORT, &opt,
-             sizeof(opt));
+  setsockopt(listener_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
 
   if (bind(listener_fd, (struct sockaddr*)&address, sizeof(address)) < 0) {
     log_tracker("[Error] bind for replication port failed: ", strerror(errno));
     close(listener_fd);
     return;
   }
+  listen(listener_fd, 16);
 
-  listen(listener_fd, 1);  while (!should_stop) {
-    if (trackers_ref.size() <= 1) {
-      // Single-tracker deployment: nobody to elect with, so become PRIMARY
-      // immediately. Probing would only connect back to our own listener.
-      if (!is_primary) {
-        log_tracker("[Replication] Single tracker setup. Becoming PRIMARY.");
-        is_primary = true;
-      }
-    } else {
-      // Try connecting to the other tracker first (for election)
-      int probe_sock = socket(AF_INET, SOCK_STREAM, 0);
-      struct sockaddr_in other_addr;
-      other_addr.sin_family = AF_INET;
-      other_addr.sin_port = htons(other_tracker_info.port + 1000);
-      inet_pton(AF_INET, other_tracker_info.ip.c_str(), &other_addr.sin_addr);
-      if (connect(probe_sock, (struct sockaddr*)&other_addr,
-                  sizeof(other_addr)) < 0) {
-        if (!is_primary) {
-          log_tracker("[Replication] No active primary found. Becoming PRIMARY.");
-          is_primary = true;
-        }
-        close(probe_sock);
-      } else {
-        log_tracker("[Replication] Found active primary. Staying BACKUP.");
-        is_primary = false;
-        close(probe_sock);
-      }
-    }
-    if (is_primary) {
-      run_primary_mode(listener_fd);
-    } else {
-      run_backup_mode();
-    }
+  if (has_other_tracker) {
+    run_backup_mode();  // Returns once this tracker must become primary.
+  } else {
+    log_tracker("[Replication] Single tracker setup.");
+  }
+
+  if (!should_stop) {
+    // A new primary starts with no sessions: clients must log in again,
+    // which also publishes their peer addresses here.
+    state.clear_sessions();
+    is_primary = true;
+    run_primary_mode(listener_fd);
   }
   close(listener_fd);
 }
@@ -134,156 +120,117 @@ void ReplicationManager::run() {
 void ReplicationManager::run_primary_mode(int listener_fd) {
   log_tracker("[Replication] Running in PRIMARY mode.");
 
-  // Ensure backup socket is reset at the start of primary mode
-  {
-    std::lock_guard<std::mutex> lock(replication_mutex);
-    if (backup_sock >= 0) {
-      close(backup_sock);
-    }
-    backup_sock = -1;
-  }
+  while (!should_stop) {
+    fd_set read_fds;
+    FD_ZERO(&read_fds);
+    FD_SET(listener_fd, &read_fds);
+    struct timeval timeout;
+    timeout.tv_sec = HEARTBEAT_INTERVAL_SEC;
+    timeout.tv_usec = 0;
+    int activity = select(listener_fd + 1, &read_fds, NULL, NULL, &timeout);
 
-  while (!should_stop && is_primary) {
-    int current_backup_sock = -1;
-    {
+    if (activity > 0) {
+      // A (re)connecting backup always replaces the previous connection.
+      int new_sock = accept(listener_fd, NULL, NULL);
+      if (new_sock < 0)
+        continue;
+      set_io_timeout(new_sock, SO_SNDTIMEO, 5);
+
+      // Snapshot and switch-over happen under the replication lock, so no
+      // forwarded command can fall between the snapshot and live forwarding.
       std::lock_guard<std::mutex> lock(replication_mutex);
-      current_backup_sock = backup_sock;
-    }
-
-    if (current_backup_sock < 0) {
-      log_tracker("[Replication] Waiting for a backup tracker to connect...");
-
-      fd_set read_fds;
-      FD_ZERO(&read_fds);
-      FD_SET(listener_fd, &read_fds);
-
-      struct timeval timeout;
-      timeout.tv_sec = 2;  // Check for a new connection every 2 seconds
-      timeout.tv_usec = 0;
-
-      int activity = select(listener_fd + 1, &read_fds, NULL, NULL, &timeout);
-      if (activity > 0) {
-        int new_sock = accept(listener_fd, NULL, NULL);
-        if (new_sock >= 0) {
-          log_tracker("[Replication] Backup tracker connected.");
-          log_tracker("[Replication] Sending full state to new backup...");
-          std::string full_state = state.serialize_state();
-          std::string sync_message = "FULL_STATE_SYNC\n" + full_state;
-
-          if (!sendMessage(new_sock, sync_message)) {
-            log_tracker("[Replication] Failed to send state to backup.");
-            close(new_sock);
-          } else {
-            log_tracker("[Replication] Full state sync complete.");
-            std::lock_guard<std::mutex> lock(replication_mutex);
-            backup_sock = new_sock;
-
-            // Flush queued commands
-            for (const auto& cmd : command_queue) {
-              if (!sendMessage(backup_sock, cmd)) {
-                log_tracker(
-                    "[Replication] Failed while flushing queue. "
-                    "Will retry on next reconnect.");
-                close(backup_sock);
-                backup_sock = -1;
-                break;
-              }
-            }
-            if (backup_sock >= 0) {
-              log_tracker("[Replication] Command queue flushed to backup.");
-              command_queue.clear();
-            }
-          }
-        }
+      if (backup_sock >= 0)
+        close(backup_sock);
+      backup_sock = -1;
+      if (sendMessage(new_sock, "FULL_STATE_SYNC\n" + state.serialize_state())) {
+        log_tracker("[Replication] Backup tracker connected; full state sent.");
+        backup_sock = new_sock;
+      } else {
+        log_tracker("[Replication] Failed to send state to backup.");
+        close(new_sock);
       }
-    } else {
-      std::this_thread::sleep_for(std::chrono::seconds(2));
+    } else if (activity == 0) {
       std::lock_guard<std::mutex> lock(replication_mutex);
-      if (backup_sock >= 0) {
-        if (!sendMessage(backup_sock, "HEARTBEAT")) {
-          log_tracker(
-              "[Replication] Backup disconnected. Will wait for reconnect.");
-          close(backup_sock);
-          backup_sock = -1;
-        }
+      if (backup_sock >= 0 && !sendMessage(backup_sock, "HEARTBEAT")) {
+        log_tracker(
+            "[Replication] Backup disconnected. Will wait for reconnect.");
+        close(backup_sock);
+        backup_sock = -1;
       }
     }
   }
 
-  // Cleanup on exit
   std::lock_guard<std::mutex> lock(replication_mutex);
   if (backup_sock >= 0)
     close(backup_sock);
+  backup_sock = -1;
 }
 
+// Connects to the other tracker's replication port. Returns the socket, or
+// -1 if the other tracker is not reachable.
+int ReplicationManager::connect_to_other_tracker() const {
+  int sock = socket(AF_INET, SOCK_STREAM, 0);
+  if (sock < 0)
+    return -1;
+  // The send timeout also bounds connect(), so a dead host cannot hang us.
+  set_io_timeout(sock, SO_SNDTIMEO, ROLE_WAIT_SEC);
+  set_io_timeout(sock, SO_RCVTIMEO, ROLE_WAIT_SEC);
+
+  struct sockaddr_in other_addr;
+  other_addr.sin_family = AF_INET;
+  other_addr.sin_port = htons(other_tracker_info.port + 1000);
+  if (inet_pton(AF_INET, other_tracker_info.ip.c_str(), &other_addr.sin_addr) <=
+          0 ||
+      connect(sock, (struct sockaddr*)&other_addr, sizeof(other_addr)) < 0) {
+    close(sock);
+    return -1;
+  }
+  return sock;
+}
+
+// Follows the other tracker for as long as it acts as primary. Returns when
+// this tracker should take over (or on shutdown).
 void ReplicationManager::run_backup_mode() {
-  log_tracker("[Replication] Running in BACKUP mode. Waiting for primary...");
+  bool was_following = false;
 
-  int primary_sock = socket(AF_INET, SOCK_STREAM, 0);
-  struct sockaddr_in primary_addr;
-  primary_addr.sin_family = AF_INET;
-  primary_addr.sin_port = htons(other_tracker_info.port + 1000);
-  inet_pton(AF_INET, other_tracker_info.ip.c_str(), &primary_addr.sin_addr);
-
-  // Connect with a bounded timeout: a blocking connect() to a dead peer can
-  // hang for minutes, delaying failover. On timeout, close and retry so the
-  // election loop (and should_stop) stays responsive.
-  int conn_err = 0;
-  while (true) {
-    if (connect(primary_sock, (struct sockaddr*)&primary_addr,
-                sizeof(primary_addr)) == 0) {
-      break;  // Connected.
-    }
-    if (errno == EINTR) {
-      continue;
-    }
-    if (errno != EINPROGRESS) {
-      conn_err = errno;  // Hard failure (refused/unreachable): retry below.
-    } else {
-      fd_set wfds;
-      FD_ZERO(&wfds);
-      FD_SET(primary_sock, &wfds);
-      struct timeval timeout;
-      timeout.tv_sec = 2;
-      timeout.tv_usec = 0;
-      int rc = select(primary_sock + 1, NULL, &wfds, NULL, &timeout);
-      if (rc > 0) {
-        socklen_t err_len = sizeof(conn_err);
-        getsockopt(primary_sock, SOL_SOCKET, SO_ERROR, &conn_err, &err_len);
-      } else {
-        conn_err = ETIMEDOUT;
-      }
-    }
-
-    if (should_stop) {
-      close(primary_sock);
+  while (!should_stop) {
+    int primary_sock = connect_to_other_tracker();
+    if (primary_sock < 0) {
+      log_tracker("[Replication] Other tracker is not reachable.");
       return;
     }
-    log_tracker("[Replication] Could not connect to primary (",
-                strerror(conn_err), "). Retrying...");
-    close(primary_sock);
-    primary_sock = socket(AF_INET, SOCK_STREAM, 0);
-    std::this_thread::sleep_for(std::chrono::seconds(2));
-  }
 
-  log_tracker("[Replication] Primary tracker connected.");
-
-  while (!should_stop && !is_primary) {
     std::string message;
-    if (receiveMessage(primary_sock, message)) {
+    if (!receiveMessage(primary_sock, message)) {
+      // Reachable but silent: the other tracker is not serving as primary.
+      close(primary_sock);
+      if (was_following) {
+        log_tracker("[Replication] Primary stopped responding.");
+        return;
+      }
+      if (self_id < other_id) {
+        // Both trackers are undecided: the lower id takes the role.
+        log_tracker("[Replication] No active primary found.");
+        return;
+      }
+      std::this_thread::sleep_for(std::chrono::milliseconds(500));
+      continue;
+    }
+
+    log_tracker("[Replication] Found active primary. Running in BACKUP mode.");
+    was_following = true;
+    set_io_timeout(primary_sock, SO_RCVTIMEO, PRIMARY_SILENCE_SEC);
+    do {
       if (message != "HEARTBEAT") {
-        log_tracker("[Replication] Received command: ", message);
+        log_tracker_debug("[Replication] Received command: ", message);
         state.process_replicated_command(message);
       }
-    } else {
-      log_tracker("[Replication] Primary disconnected. Promoting to PRIMARY.");
-      is_primary = true;
-      state.clear_sessions();
-      log_tracker(
-          "[Replication] All client sessions invalidated. Clients must "
-          "re-login.");
-      break;  // Exit loop to re-evaluate role
-    }
+    } while (!should_stop && receiveMessage(primary_sock, message));
+    close(primary_sock);
+
+    // The connection dropped or went quiet. Loop to find out whether the
+    // primary is really gone before taking over.
+    if (!should_stop)
+      log_tracker("[Replication] Lost contact with primary. Re-checking...");
   }
-  close(primary_sock);
 }

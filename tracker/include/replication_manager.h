@@ -1,7 +1,6 @@
 #pragma once
 
 #include <atomic>
-#include <deque>
 #include <mutex>
 #include <string>
 #include <thread>
@@ -25,27 +24,28 @@ class ReplicationManager {
   void stop();
 
   bool is_primary_() const;
+  // Sends a state-changing command to the backup, if one is connected. A
+  // backup that connects later receives the full state instead.
   void forward_command(const std::string& command_str);
 
  private:
   void run();
   void run_primary_mode(int listener_fd);
   void run_backup_mode();
+  int connect_to_other_tracker() const;
 
   int self_id;
+  int other_id;
   TrackerState& state;
-  // Copy of the tracker list: run() needs the size to decide whether an
-  // election peer even exists (single-tracker deployments must not probe).
-  std::vector<TrackerInfo> trackers_ref;
+  // False in a single-tracker deployment: there is nobody to elect with.
+  bool has_other_tracker;
   TrackerInfo self_info;
   TrackerInfo other_tracker_info;
 
   std::atomic<bool> is_primary;
   std::atomic<bool> should_stop;
 
-  std::mutex replication_mutex;
+  std::mutex replication_mutex;  // Guards backup_sock and writes to it.
   int backup_sock = -1;
   std::thread replication_thread;
-
-  std::deque<std::string> command_queue;
 };

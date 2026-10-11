@@ -3,12 +3,10 @@
 #include <sys/socket.h>
 #include <unistd.h>
 
-#include <cmath>
 #include <sstream>
 #include <string>
 #include <thread>
 #include <unordered_map>
-#include <vector>
 
 #include "hashing.h"
 #include "include/client_peer.h"
@@ -16,34 +14,46 @@
 #include "include/ui.h"
 #include "protocol.h"
 
-// Make this file aware of the global map of files this client is sharing.
+// Make this file aware of the global maps of files this client is sharing.
+// Both are keyed by file_key(group_id, file_name).
 extern std::unordered_map<std::string, SeededFileInfo> seeded_files;
 extern std::mutex seeded_files_mutex;
 extern std::unordered_map<std::string, std::shared_ptr<DownloadState>>
     g_downloads;
 extern std::mutex g_downloads_mutex;
 
-// Seeder State Helpers
-bool is_file_seeded(const std::string& file_name) {
-  // First, check if it's a fully seeded file.
-  {
-    std::lock_guard<std::mutex> lock(seeded_files_mutex);
-    if (seeded_files.count(file_name) > 0) {
-      return true;
-    }
-  }
+namespace {
 
-  // If not, check if it's an active (partial) download.
+struct ServedFile {
+  std::string path;
+  long long file_size = 0;
+  // Set while the file is still being downloaded (we are a partial seeder).
+  std::shared_ptr<DownloadState> download;
+};
+
+// Looks up a file we can serve: an in-progress download first, then the
+// fully seeded files.
+bool find_served_file(const std::string& key, ServedFile& out) {
   {
     std::lock_guard<std::mutex> lock(g_downloads_mutex);
-    if (g_downloads.count(file_name) > 0) {
+    auto it = g_downloads.find(key);
+    if (it != g_downloads.end() && !it->second->download_complete.load()) {
+      out.download = it->second;
+      out.path = it->second->destination_path;
+      out.file_size = it->second->file_size;
       return true;
     }
   }
-
-  // If it's in neither map, we don't have it.
-  return false;
+  std::lock_guard<std::mutex> lock(seeded_files_mutex);
+  auto it = seeded_files.find(key);
+  if (it == seeded_files.end())
+    return false;
+  out.path = it->second.path;
+  out.file_size = it->second.file_size;
+  return true;
 }
+
+}  // namespace
 
 void handle_peer_connection(int peer_sock) {
   log_debug("[Peer Thread] New peer connected on socket ", peer_sock);
@@ -57,8 +67,8 @@ void handle_peer_connection(int peer_sock) {
   log_debug("[Peer Thread] Received from peer: ", handshake_message);
 
   std::stringstream ss(handshake_message);
-  std::string command, file_name;
-  ss >> command >> file_name;
+  std::string command, group_id, file_name;
+  ss >> command >> group_id >> file_name;
 
   if (command != "HANDSHAKE" || file_name.empty()) {
     sendMessage(peer_sock, "HANDSHAKE_FAIL: Invalid handshake");
@@ -66,132 +76,67 @@ void handle_peer_connection(int peer_sock) {
     return;
   }
 
-  if (!is_file_seeded(file_name)) {
+  ServedFile file;
+  if (!find_served_file(file_key(group_id, file_name), file)) {
     sendMessage(peer_sock, "HANDSHAKE_FAIL: File not found");
-    close(peer_sock);
-    return;
-  }
-
-  std::string local_path;
-  long long file_size = 0;
-  bool is_partial = false;
-  std::shared_ptr<DownloadState> download_state = nullptr;
-
-  // First, check if it's an active download
-  {
-    std::lock_guard<std::mutex> lock(g_downloads_mutex);
-    auto it = g_downloads.find(file_name);
-    if (it != g_downloads.end()) {
-      download_state = it->second;
-      // Lock the specific download's state to safely read from it
-      std::lock_guard<std::mutex> state_lock(download_state->state_mutex);
-      local_path = download_state->destination_path;
-      file_size = download_state->file_size;
-      is_partial = true;
-    }
-  }
-
-  // If it wasn't a partial download, check if it's a fully seeded file
-  if (!is_partial) {
-    std::lock_guard<std::mutex> lock(seeded_files_mutex);
-    auto it = seeded_files.find(file_name);
-    if (it != seeded_files.end()) {
-      local_path = it->second.path;
-      file_size = it->second.file_size;
-    }
-  }
-
-  // If we couldn't find the file in either map, we don't have it.
-  if (local_path.empty()) {
-    sendMessage(peer_sock, "HANDSHAKE_FAIL: File not found in any state");
     close(peer_sock);
     return;
   }
 
   sendMessage(peer_sock, "HANDSHAKE_OK");
 
-  // Logic to Send Bitfield
-  try {
-    int num_pieces = std::ceil(static_cast<double>(file_size) / PIECE_SIZE);
-    std::string bitfield_to_send;
-
-    if (is_partial && download_state) {
-      // CASE 1: The file is currently being downloaded. We are a partial
-      // seeder. Construct the bitfield based on the pieces we actually have.
-      std::lock_guard<std::mutex> state_lock(download_state->state_mutex);
-      bitfield_to_send.reserve(num_pieces);
-      for (bool have_piece : download_state->pieces_we_have) {
-        bitfield_to_send += (have_piece ? '1' : '0');
-      }
-      log_debug("[Peer Thread] Sending PARTIAL bitfield for ", file_name);
-    } else {
-      // CASE 2: The file is not being downloaded, so it must be a fully seeded
-      // file. Construct a bitfield of all '1's.
-      bitfield_to_send = std::string(num_pieces, '1');
-      log_debug("[Peer Thread] Sending FULL bitfield for ", file_name);
+  const long long num_pieces = piece_count(file.file_size);
+  std::string bitfield(num_pieces, '1');
+  if (file.download) {
+    // Partial seeder: advertise only the pieces we actually have.
+    std::lock_guard<std::mutex> lock(file.download->state_mutex);
+    for (long long i = 0; i < num_pieces; ++i) {
+      if (!file.download->pieces_we_have[i])
+        bitfield[i] = '0';
     }
-    // Now, send the correctly constructed bitfield to the peer.
-    sendMessage(peer_sock, "BITFIELD " + bitfield_to_send);
-  } catch (const std::exception& e) {
-    // This block will now catch potential issues, like the file path missing
-    // for a seeder.
-    log_error("[Peer Thread] Error during bitfield generation: ", e.what());
-    // It's best to close the connection if we can't send a valid bitfield.
-    close(peer_sock);
-    return;
   }
+  sendMessage(peer_sock, "BITFIELD " + bitfield);
 
-  // Handle Piece Requests
+  // Handle Piece Requests. The file is opened on the first request and kept
+  // open for the rest of the connection.
+  int fd = -1;
   std::string request_message;
   while (receiveMessage(peer_sock, request_message)) {
-    std::stringstream request_ss(request_message);
-    std::vector<std::string> request_tokens;
-    std::string request_token;
-    while (request_ss >> request_token) {
-      request_tokens.push_back(request_token);
+    std::istringstream request_ss(request_message);
+    std::string request;
+    long long piece_index = -1;
+    if (!(request_ss >> request >> piece_index) ||
+        request != "REQUEST_PIECE") {
+      continue;  // Not a well-formed piece request; ignore it.
     }
-
-    if (request_tokens.empty() || request_tokens[0] != "REQUEST_PIECE")
+    if (piece_index < 0 || piece_index >= num_pieces) {
+      log_debug("[Peer Thread] Rejecting out-of-range piece request ",
+                piece_index, " for ", file_name);
+      continue;
+    }
+    if (file.download) {
+      std::lock_guard<std::mutex> lock(file.download->state_mutex);
+      if (!file.download->pieces_we_have[piece_index])
+        continue;  // Not downloaded yet.
+    }
+    if (fd < 0 && (fd = open(file.path.c_str(), O_RDONLY)) < 0)
       continue;
 
-    if (request_tokens.size() == 2) {
-      int piece_index = -1;
-      try {
-        piece_index = std::stoi(request_tokens[1]);
-      } catch (const std::exception&) {
-        continue;  // Malformed index; ignore the request.
-      }
-      long long max_pieces = (file_size + PIECE_SIZE - 1) / PIECE_SIZE;
-      if (piece_index < 0 || piece_index >= max_pieces) {
-        log_debug("[Peer Thread] Rejecting out-of-range piece request ",
-                    piece_index, " for ", file_name);
-        continue;
-      }
-      int fd = open(local_path.c_str(), O_RDONLY);
-      if (fd < 0)
-        continue;
-
-      // Seek to the correct offset with lseek()
-      long long offset = (long long)piece_index * PIECE_SIZE;
-      lseek(fd, offset, SEEK_SET);
-
-      std::vector<char> buffer(PIECE_SIZE);
-      // Read data with read()
-      ssize_t bytes_read = read(fd, buffer.data(), PIECE_SIZE);
-
-      if (bytes_read > 0) {
-        std::string header = "PIECE " + std::to_string(piece_index) + " ";
-        std::string piece_message;
-        piece_message.reserve(header.length() + bytes_read);
-        piece_message.append(header);
-        piece_message.append(buffer.data(), bytes_read);
-
-        sendMessage(peer_sock, piece_message);
-      }
-      close(fd);
-    }
+    // Read the piece directly behind the header to avoid an extra copy.
+    std::string piece_message = "PIECE " + std::to_string(piece_index) + " ";
+    const size_t header_len = piece_message.size();
+    piece_message.resize(header_len + PIECE_SIZE);
+    ssize_t bytes_read = pread(fd, &piece_message[header_len], PIECE_SIZE,
+                               static_cast<off_t>(piece_index) * PIECE_SIZE);
+    if (bytes_read <= 0)
+      continue;
+    piece_message.resize(header_len + bytes_read);
+    if (!sendMessage(peer_sock, piece_message))
+      break;
   }
 
+  if (fd >= 0)
+    close(fd);
   close(peer_sock);
   log_debug("[Peer Thread] Peer ", peer_sock, " disconnected.");
 }

@@ -10,7 +10,7 @@
 #include <unistd.h>
 
 #include <atomic>
-#include <cmath>
+#include <cerrno>
 #include <condition_variable>
 #include <cstdlib>
 #include <cstring>
@@ -30,6 +30,7 @@
 #include "protocol.h"
 
 // Global State
+// Both maps are keyed by file_key(group_id, file_name).
 std::unordered_map<std::string, SeededFileInfo> seeded_files;
 std::mutex seeded_files_mutex;
 std::unordered_map<std::string, std::shared_ptr<DownloadState>> g_downloads;
@@ -40,38 +41,30 @@ std::atomic_bool is_logged_in(false);  // Client-side authentication state
 // (which runs on the main thread) and login/logout handlers all use it.
 std::string current_user_id = "";
 
-// State for Raw Mode Line Editor
+// State for Raw Mode Line Editor. Background threads redraw the prompt when
+// they log, so current_line, cursor_pos and current_user_id are only modified
+// with cout_mutex held.
 std::string current_line;
 size_t cursor_pos = 0;
 std::mutex cout_mutex;
 struct termios orig_termios;
+
+// Tracker connection and this peer's listening socket. Used by the main
+// thread only.
+static int g_tracker_fd = -1;
+static bool g_tracker_lost = false;
+static int g_peer_server_fd = -1;
+static std::string g_self_port;
 
 // Command history for Up/Down arrow navigation.
 static std::vector<std::string> input_history;
 static size_t history_nav = 0;        // Current position while navigating.
 static std::string nav_snapshot;      // Line being typed when nav started.
 
+// Directory that holds the client's private state (history, .meta files).
 std::string get_application_home() {
-  // This function points to a specific, hardcoded directory.
-  const char* home_dir_cstr = getenv("HOME");
-  if (home_dir_cstr == nullptr) {
-    log_message(
-        "Error: Could not determine home directory to build application path.");
-    // Fallback to the current directory if HOME isn't set.
-    return ".";
-  }
-  std::string home_dir(home_dir_cstr);
-
-  // Prioritize the specific development directory
-  std::string dev_path =
-      home_dir + "/Programming/Assignments/AOS/2025201056_A3";
-  struct stat st;
-  if (stat(dev_path.c_str(), &st) == 0 && S_ISDIR(st.st_mode)) {
-    return dev_path;
-  }
-
-  // Fallback to the standard user-specific hidden directory
-  return home_dir;
+  const char* home_dir = getenv("HOME");
+  return home_dir ? home_dir : ".";
 }
 
 void disable_raw_mode() {
@@ -329,147 +322,633 @@ void tab_complete() {
 
 }  // namespace
 
-// Helper to check connection health
-bool safe_send(int sockfd, const std::string& msg) {
-  if (!sendMessage(sockfd, msg)) {
-    exit_program = true;
-    if (sockfd >= 0)
-      close(sockfd);
-    return false;
+// ----------------------------------------------------------------------------
+// Tracker communication
+// ----------------------------------------------------------------------------
+
+// One request/response round trip with the tracker. The tracker answers every
+// command with exactly one message, so all traffic goes through here to keep
+// the stream in step. A failure means the tracker is gone: the client exits.
+bool tracker_request(const std::string& command, std::string& response) {
+  if (sendMessage(g_tracker_fd, command) &&
+      receiveMessage(g_tracker_fd, response)) {
+    return true;
   }
-  return true;
+  g_tracker_lost = true;
+  exit_program = true;
+  return false;
 }
 
-bool safe_recv(int sockfd, std::string& response) {
-  if (!receiveMessage(sockfd, response)) {
-    exit_program = true;
-    if (sockfd >= 0)
-      close(sockfd);
-    return false;
-  }
-  return true;
+bool is_success(const std::string& response) {
+  return response.rfind("SUCCESS", 0) == 0;
 }
 
-void parse_meta_content(const std::string& content,
-                        std::string& group_id,
-                        std::string& logical_name,
-                        std::string& local_path,
-                        long long& file_size,
-                        std::string& hashes) {
-  std::stringstream ss(content);
-  std::string line;
-  while (std::getline(ss, line)) {
-    size_t colon_pos = line.find(':');
-    if (colon_pos != std::string::npos) {
-      std::string key = line.substr(0, colon_pos);
-      std::string value = line.substr(colon_pos + 1);
-      if (key == "group_id")
-        group_id = value;
-      else if (key == "logical_name")
-        logical_name = value;
-      else if (key == "local_path")
-        local_path = value;
-      else if (key == "file_size")
-        file_size = std::stoll(value);
-      else if (key == "hashes")
-        hashes = value;
+// Connects to the first tracker in the list that reports itself PRIMARY.
+// Returns the connected socket, or -1.
+int connect_to_primary_tracker(const std::string& tracker_info_path) {
+  std::ifstream info(tracker_info_path);
+  if (!info) {
+    log_error("Could not open tracker info file: ", tracker_info_path);
+    return -1;
+  }
+
+  std::string addr;
+  bool any_address = false;
+  while (std::getline(info, addr)) {
+    if (addr.empty())
+      continue;
+    any_address = true;
+
+    size_t colon_pos = addr.find(':');
+    struct sockaddr_in serv_addr;
+    serv_addr.sin_family = AF_INET;
+    try {
+      if (colon_pos == std::string::npos)
+        throw std::invalid_argument("missing port");
+      serv_addr.sin_port = htons(std::stoi(addr.substr(colon_pos + 1)));
+    } catch (const std::exception&) {
+      log_warn("Skipping malformed tracker address: ", addr);
+      continue;
     }
+    if (inet_pton(AF_INET, addr.substr(0, colon_pos).c_str(),
+                  &serv_addr.sin_addr) <= 0) {
+      log_warn("Skipping malformed tracker address: ", addr);
+      continue;
+    }
+
+    int sockfd = socket(AF_INET, SOCK_STREAM, 0);
+    if (sockfd < 0) {
+      perror("socket creation failed");
+      continue;
+    }
+    struct timeval timeout;
+    timeout.tv_sec = 2;  // Bounds the connect and the role exchange.
+    timeout.tv_usec = 0;
+    setsockopt(sockfd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof timeout);
+    setsockopt(sockfd, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof timeout);
+
+    std::string role_response;
+    if (connect(sockfd, (struct sockaddr*)&serv_addr, sizeof(serv_addr)) != 0) {
+      log_message("Could not connect to tracker at ", addr, ". Trying next...");
+    } else if (!receiveMessage(sockfd, role_response) ||
+               role_response != "ROLE PRIMARY") {
+      log_message("Could not get primary role from ", addr,
+                  ". Trying next...");
+    } else {
+      log_message("Successfully connected to PRIMARY tracker at ", addr);
+      timeout.tv_sec = 5;  // 5-second timeout for commands
+      setsockopt(sockfd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof timeout);
+      setsockopt(sockfd, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof timeout);
+      return sockfd;
+    }
+    close(sockfd);
   }
+
+  if (!any_address) {
+    log_error("No tracker addresses found in ", tracker_info_path);
+  } else {
+    log_error("Failed to connect to any available tracker.");
+  }
+  return -1;
 }
 
+// ----------------------------------------------------------------------------
+// Persistent seeding state (.meta files)
+// ----------------------------------------------------------------------------
+
+// Returns the per-user state directory, creating it if needed.
+std::string user_state_dir(const std::string& user_id) {
+  std::string dir = get_application_home() + "/.p2p_client";
+  mkdir(dir.c_str(), 0755);
+  dir += "/users";
+  mkdir(dir.c_str(), 0755);
+  dir += "/" + user_id;
+  mkdir(dir.c_str(), 0755);
+  return dir;
+}
+
+std::string meta_file_path(const std::string& user_id,
+                           const std::string& group_id,
+                           const std::string& file_name) {
+  return user_state_dir(user_id) + "/" + group_id + "_" + file_name + ".meta";
+}
+
+// Records a fully available file so it is seeded again after a restart.
 void save_metadata_file(const std::string& user_id,
                         const std::string& group_id,
                         const std::string& file_name,
                         const std::string& local_path,
-                        long long file_size,
-                        const std::string& hashes) {
-  // Create user-specific directories
-  std::string app_home = get_application_home();
-  std::string p2pclient = app_home + "/.p2p_client";
-  std::string p2pclientUser = p2pclient + "/users";
-  std::string user_dir = app_home + "/.p2p_client/users/" + user_id;
-  mkdir(p2pclient.c_str(), 0755);
-  mkdir(p2pclientUser.c_str(), 0755);
-  mkdir(user_dir.c_str(), 0755);
-
-  std::string meta_path = user_dir + "/" + group_id + "_" + file_name + ".meta";
-
-  // O_TRUNC will clear the file if it exists, ensuring we write fresh data.
-  int fd = open(meta_path.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0666);
-  if (fd < 0) {
-    log_error("Could not open .meta file for writing: ", meta_path);
-    return;
+                        long long file_size) {
+  const std::string meta_path = meta_file_path(user_id, group_id, file_name);
+  std::ofstream out(meta_path, std::ios::trunc);
+  out << "group_id:" << group_id << "\n"
+      << "logical_name:" << file_name << "\n"
+      << "local_path:" << local_path << "\n"
+      << "file_size:" << file_size << "\n";
+  if (!out) {
+    log_error("Could not save metadata for '", file_name, "': ", meta_path);
   }
-
-  std::stringstream ss;
-  ss << "group_id:" << group_id << "\n";
-  ss << "logical_name:" << file_name << "\n";
-  ss << "local_path:" << local_path << "\n";
-  ss << "file_size:" << file_size << "\n";
-  ss << "hashes:" << hashes << "\n";
-  std::string content = ss.str();
-
-  if (write(fd, content.c_str(), content.length()) < 0) {
-    log_error("Could not save metadata for '", file_name, "': ",
-              strerror(errno));
-  }
-  close(fd);
 }
 
+// Rebuilds seeded_files from the user's .meta files. Unreadable or malformed
+// entries are skipped.
 void load_state_from_disk(const std::string& user_id) {
-  std::string app_home = get_application_home();
-  if (app_home.empty())
-    return;
-  std::string user_dir = app_home + "/.p2p_client/users/" + user_id;
+  const std::string user_dir = user_state_dir(user_id);
   DIR* dir = opendir(user_dir.c_str());
-  if (!dir)
-    return;  // No state to load, or directory doesn't exist yet.
 
   std::lock_guard<std::mutex> lock(seeded_files_mutex);
   seeded_files.clear();  // Clear any old state from a previous user
+  if (!dir)
+    return;
 
   struct dirent* entry;
   while ((entry = readdir(dir)) != nullptr) {
-    std::string filename = entry->d_name;
-    if (filename.size() > 5 &&
-        filename.substr(filename.size() - 5) == ".meta") {
-      std::string meta_path = user_dir + "/" + filename;
+    const std::string filename = entry->d_name;
+    if (filename.size() <= 5 ||
+        filename.compare(filename.size() - 5, 5, ".meta") != 0) {
+      continue;
+    }
 
-      int fd = open(meta_path.c_str(), O_RDONLY);
-      if (fd < 0)
+    std::ifstream in(user_dir + "/" + filename);
+    std::string line, group_id, logical_name, local_path;
+    long long file_size = -1;
+    while (std::getline(in, line)) {
+      const size_t colon_pos = line.find(':');
+      if (colon_pos == std::string::npos)
         continue;
-
-      char buffer[4096];  // Assume .meta files are smaller than 4KB
-      ssize_t bytes_read = read(fd, buffer, sizeof(buffer) - 1);
-      close(fd);
-
-      if (bytes_read > 0) {
-        buffer[bytes_read] = '\0';  // Null-terminate the string
-        std::string content(buffer);
-
-        std::string group_id, logical_name, local_path, hashes;
-        long long file_size;
-
-        parse_meta_content(content, group_id, logical_name, local_path,
-                           file_size, hashes);
-
-        if (!logical_name.empty() && !local_path.empty()) {
-          // Check if the actual data file still exists on disk
-          struct stat file_stat_buffer;
-          if (stat(local_path.c_str(), &file_stat_buffer) == 0) {
-            seeded_files[logical_name] = {local_path, file_size};
-          } else {
-            log_message("[State] Metadata found for '", logical_name,
-                        "' but local file is missing.");
-          }
+      const std::string key = line.substr(0, colon_pos);
+      const std::string value = line.substr(colon_pos + 1);
+      if (key == "group_id") {
+        group_id = value;
+      } else if (key == "logical_name") {
+        logical_name = value;
+      } else if (key == "local_path") {
+        local_path = value;
+      } else if (key == "file_size") {
+        try {
+          file_size = std::stoll(value);
+        } catch (const std::exception&) {
+          file_size = -1;
         }
       }
+    }
+    if (group_id.empty() || logical_name.empty() || local_path.empty() ||
+        file_size < 0) {
+      log_warn("[State] Ignoring malformed metadata file: ", filename);
+      continue;
+    }
+
+    // Check if the actual data file still exists on disk
+    struct stat file_stat_buffer;
+    if (stat(local_path.c_str(), &file_stat_buffer) == 0) {
+      seeded_files[file_key(group_id, logical_name)] = {local_path, file_size};
+    } else {
+      log_message("[State] Metadata found for '", logical_name,
+                  "' but local file is missing.");
     }
   }
   closedir(dir);
   log_debug("[State] Loaded ", seeded_files.size(),
-              " seeded files from disk for user ", user_id);
+            " seeded files from disk for user ", user_id);
 }
+
+// ----------------------------------------------------------------------------
+// Commands
+// ----------------------------------------------------------------------------
+
+// Tells the tracker we seed a complete file and, once it agrees, records the
+// file locally. An empty file has no piece hashes; "-" stands in for them so
+// the command keeps its token count.
+void announce_seed(const std::string& group_id,
+                   const std::string& file_name,
+                   const std::string& absolute_path,
+                   long long file_size,
+                   const std::string& hashes) {
+  std::string response;
+  if (!tracker_request("upload_file " + group_id + " " + file_name + " " +
+                           std::to_string(file_size) + " " +
+                           (hashes.empty() ? "-" : hashes),
+                       response)) {
+    return;
+  }
+  log_tracker_response(response);
+  if (!is_success(response))
+    return;
+  {
+    std::lock_guard<std::mutex> lock(seeded_files_mutex);
+    seeded_files[file_key(group_id, file_name)] = {absolute_path, file_size};
+  }
+  save_metadata_file(current_user_id, group_id, file_name, absolute_path,
+                     file_size);
+}
+
+void cmd_upload_file(const std::vector<std::string>& tokens) {
+  if (tokens.size() != 3) {
+    log_warn("Usage: upload_file <group_id> <file_path>");
+    return;
+  }
+  const std::string& group_id = tokens[1];
+  const std::string& user_provided_path = tokens[2];
+
+  // The logical name is the part of the path after the last '/'
+  std::string logical_name = user_provided_path;
+  size_t last_slash = logical_name.find_last_of('/');
+  if (last_slash != std::string::npos) {
+    logical_name = logical_name.substr(last_slash + 1);
+  }
+
+  // Convert the user-provided path to an absolute path for local storage.
+  char resolved_path[PATH_MAX];
+  if (realpath(user_provided_path.c_str(), resolved_path) == NULL) {
+    log_error("Cannot find or resolve file path: ", user_provided_path);
+    return;
+  }
+
+  try {
+    log_message("Sharing file: ", logical_name, "...");
+    FileHashes hashes = compute_hashes(resolved_path);
+    log_message("File size: ", hashes.file_size, " bytes");
+    announce_seed(group_id, logical_name, resolved_path, hashes.file_size,
+                  hashes.concatenated_hashes);
+  } catch (const std::exception& e) {
+    log_error("Hashing failed: ", e.what());
+  }
+}
+
+void cmd_show_downloads() {
+  std::lock_guard<std::mutex> lock(g_downloads_mutex);
+  if (g_downloads.empty()) {
+    log_message("No downloads to show.");
+    return;
+  }
+  for (const auto& pair : g_downloads) {
+    const auto& state = pair.second;
+    if (!state->download_complete.load()) {
+      log_message("[D] [", state->group_id, "] ", state->file_name, " (",
+                  state->downloaded_piece_count.load(), "/", state->num_pieces,
+                  ")");
+    } else if (state->download_successful.load()) {
+      log_message("[C] [", state->group_id, "] ", state->file_name);
+    } else {
+      log_message("[E] [", state->group_id, "] ", state->file_name,
+                  " (Failed)");
+    }
+  }
+}
+
+void cmd_download_file(const std::vector<std::string>& tokens) {
+  if (tokens.size() != 4 && tokens.size() != 5) {
+    log_warn(
+        "Usage: download_file <group_id> <file_name> "
+        "<destination_path> [algorithm]");
+    return;
+  }
+  const std::string& group_id = tokens[1];
+  const std::string& file_name = tokens[2];
+  const std::string key = file_key(group_id, file_name);
+
+  // Refuse a second concurrent download of the same file: both would write
+  // to the same map slot. A finished entry is simply replaced.
+  {
+    std::lock_guard<std::mutex> lock(g_downloads_mutex);
+    auto existing = g_downloads.find(key);
+    if (existing != g_downloads.end() &&
+        !existing->second->download_complete.load()) {
+      log_error("A download of '", file_name,
+                "' is already in progress on this client.");
+      return;
+    }
+  }
+
+  std::string response;
+  if (!tracker_request("download_file " + group_id + " " + file_name,
+                       response)) {
+    return;
+  }
+  if (!is_success(response)) {
+    log_tracker_response(response);
+    return;
+  }
+
+  // Format is "SUCCESS: <file_size> <hashes> [peer ...]".
+  std::istringstream response_ss(response);
+  std::string status, all_hashes, peer_addr;
+  long long file_size = -1;
+  response_ss >> status >> file_size >> all_hashes;
+  if (all_hashes == "-")
+    all_hashes.clear();  // Empty file: no pieces.
+
+  // Cross-check the two independent sources for the piece count (file size
+  // vs. 40 hex chars per hash). A mismatch means the metadata is corrupt;
+  // refuse the download rather than risk an out-of-bounds piece index later.
+  if (!response_ss || file_size < 0 || all_hashes.length() % 40 != 0 ||
+      static_cast<long long>(all_hashes.length() / 40) !=
+          piece_count(file_size)) {
+    log_error("Malformed download response from tracker for ", file_name,
+              ". Aborting.");
+    return;
+  }
+
+  auto state = std::make_shared<DownloadState>();
+  while (response_ss >> peer_addr) {
+    state->peers.emplace_back(peer_addr);
+  }
+  if (state->peers.empty()) {
+    log_warn("No seeders found for this file.");
+    return;
+  }
+
+  // A directory as destination means "put the file in there".
+  std::string destination_path = tokens[3];
+  struct stat dest_stat;
+  if (destination_path.back() == '/') {
+    destination_path += file_name;
+  } else if (stat(destination_path.c_str(), &dest_stat) == 0 &&
+             S_ISDIR(dest_stat.st_mode)) {
+    destination_path += "/" + file_name;
+  }
+
+  state->group_id = group_id;
+  state->file_name = file_name;
+  state->destination_path = destination_path;
+  state->file_size = file_size;
+  state->concatenated_piece_hashes = all_hashes;
+  state->algorithm = tokens.size() == 5 ? tokens[4] : "rarest";
+  state->num_pieces = static_cast<int>(piece_count(file_size));
+  state->pieces_we_have.assign(state->num_pieces, false);
+  state->pieces_in_progress.assign(state->num_pieces, false);
+  state->piece_rarity.assign(state->num_pieces, 0);
+
+  {
+    std::lock_guard<std::mutex> lock(g_downloads_mutex);
+    g_downloads[key] = state;
+  }
+
+  log_message("[Client] Notifying tracker: starting download of ", file_name);
+  if (tracker_request("start_downloading " + group_id + " " + file_name,
+                      response)) {
+    log_tracker_response(response);
+  }
+
+  std::thread download_thread(start_download, state);
+  download_thread.detach();
+}
+
+// Reports downloads that finished since the last call to the tracker: a
+// successful one turns us into a seeder, a failed one ends our leecher entry.
+// Finished downloads stay in g_downloads so show_downloads can list them.
+void finalize_finished_downloads() {
+  std::vector<std::shared_ptr<DownloadState>> finished;
+  {
+    std::lock_guard<std::mutex> lock(g_downloads_mutex);
+    for (auto& pair : g_downloads) {
+      auto& state = pair.second;
+      if (state->download_complete.load() && !state->finalized) {
+        state->finalized = true;
+        finished.push_back(state);
+      }
+    }
+  }
+
+  // Tracker round trips happen without g_downloads_mutex held, so the peer
+  // server is never blocked behind the network.
+  for (const auto& state : finished) {
+    char resolved_path[PATH_MAX];
+    if (state->download_successful.load() &&
+        realpath(state->destination_path.c_str(), resolved_path) != NULL) {
+      log_message("Download of '", state->file_name,
+                  "' complete. Notifying tracker...");
+      announce_seed(state->group_id, state->file_name, resolved_path,
+                    state->file_size, state->concatenated_piece_hashes);
+    } else {
+      log_error("Download of '", state->file_name, "' failed.");
+      std::string response;
+      tracker_request(
+          "stop_leeching " + state->group_id + " " + state->file_name,
+          response);
+    }
+  }
+}
+
+// Commands the tracker handles on its own, plus the local bookkeeping that
+// follows a successful login, logout or stop_share.
+void cmd_tracker_passthrough(const std::string& line,
+                             const std::vector<std::string>& tokens) {
+  const std::string& command = tokens[0];
+  // The tracker learns our peer port from the login command.
+  const std::string wire =
+      command == "login" ? line + " " + g_self_port : line;
+
+  std::string response;
+  if (!tracker_request(wire, response))
+    return;
+  log_tracker_response(response);
+  if (!is_success(response))
+    return;
+
+  // The tracker validated the argument count, so tokens can be indexed.
+  if (command == "login") {
+    {
+      std::lock_guard<std::mutex> lock(cout_mutex);
+      current_user_id = tokens[1];
+    }
+    is_logged_in.store(true);
+    load_state_from_disk(current_user_id);
+
+    static bool is_peer_server_running = false;
+    if (!is_peer_server_running) {
+      std::thread(run_peer_server_loop, g_peer_server_fd).detach();
+      is_peer_server_running = true;
+    }
+  } else if (command == "logout") {
+    is_logged_in.store(false);
+    std::lock_guard<std::mutex> lock(seeded_files_mutex);
+    seeded_files.clear();
+    log_debug("[Seeder Sync] Cleared seeded file state on logout");
+  } else if (command == "stop_share") {
+    const std::string meta_path =
+        meta_file_path(current_user_id, tokens[1], tokens[2]);
+    if (std::remove(meta_path.c_str()) != 0) {
+      log_error("Could not delete metadata file: ", meta_path);
+    }
+    std::lock_guard<std::mutex> lock(seeded_files_mutex);
+    seeded_files.erase(file_key(tokens[1], tokens[2]));
+  }
+}
+
+// Runs one submitted input line.
+void process_command(const std::string& line) {
+  std::stringstream ss(line);
+  std::vector<std::string> tokens;
+  std::string token;
+  while (ss >> token) {
+    tokens.push_back(token);
+  }
+  if (tokens.empty()) {
+    std::lock_guard<std::mutex> lock(cout_mutex);
+    redraw_line();
+    return;  // Whitespace-only input.
+  }
+
+  record_command(line);
+  const std::string& command = tokens[0];
+
+  if (command == "clear" || command == "cls") {
+    std::lock_guard<std::mutex> lock(cout_mutex);
+    std::cout << "\x1b[2J\x1b[3J\x1b[H" << std::flush;
+    redraw_line();
+    return;
+  }
+
+  log_message(ui::styled(ui::DIM, "ran: "), line);
+
+  if (command == "quit" || command == "exit") {
+    exit_program = true;
+  } else if (command == "help" || command == "?") {
+    print_help();
+  } else if (command != "create_user" && command != "login" &&
+             !is_logged_in.load()) {
+    log_error("You must be logged in to use this command.");
+  } else if (command == "upload_file") {
+    cmd_upload_file(tokens);
+  } else if (command == "download_file") {
+    cmd_download_file(tokens);
+  } else if (command == "show_downloads") {
+    cmd_show_downloads();
+  } else {
+    cmd_tracker_passthrough(line, tokens);
+  }
+}
+
+// ----------------------------------------------------------------------------
+// Line editor
+// ----------------------------------------------------------------------------
+
+// Waits up to timeout_ms for one byte from stdin.
+// Returns 1 if a byte was read, 0 on timeout, -1 on EOF or error.
+int read_key(char& c, int timeout_ms) {
+  fd_set read_fds;
+  FD_ZERO(&read_fds);
+  FD_SET(STDIN_FILENO, &read_fds);
+  struct timeval timeout;
+  timeout.tv_sec = timeout_ms / 1000;
+  timeout.tv_usec = (timeout_ms % 1000) * 1000;
+
+  int activity = select(STDIN_FILENO + 1, &read_fds, NULL, NULL, &timeout);
+  if (activity < 0)
+    return errno == EINTR ? 0 : -1;
+  if (activity == 0)
+    return 0;
+  return read(STDIN_FILENO, &c, 1) == 1 ? 1 : -1;
+}
+
+// Applies one keypress to the line editor. Returns true when Enter was
+// pressed, with the finished line in `submitted`.
+bool handle_key(char c, std::string& submitted) {
+  // Escape sequences (arrows, Home/End, Del) are read in full before taking
+  // cout_mutex, and with a short timeout so a bare ESC cannot stall the loop.
+  char seq[3] = {0, 0, 0};
+  if (c == 27) {
+    if (read_key(seq[0], 50) != 1 || read_key(seq[1], 50) != 1)
+      return false;
+    if (seq[0] != '[')
+      return false;  // Unknown sequence: ignored, never leaks into the line.
+    if (seq[1] >= '0' && seq[1] <= '9' &&
+        (read_key(seq[2], 50) != 1 || seq[2] != '~')) {
+      return false;
+    }
+  }
+
+  std::lock_guard<std::mutex> lock(cout_mutex);
+  if (c == '\n' || c == '\r') {
+    submitted = current_line;
+    current_line.clear();
+    cursor_pos = 0;
+    return true;
+  }
+
+  if (c == 27) {
+    switch (seq[1]) {
+      case 'A':  // Up: older history entry.
+        if (history_nav > 0) {
+          if (history_nav == input_history.size())
+            nav_snapshot = current_line;  // Remember in-progress line.
+          current_line = input_history[--history_nav];
+          cursor_pos = current_line.size();
+        }
+        break;
+      case 'B':  // Down: newer history entry.
+        if (history_nav < input_history.size()) {
+          history_nav++;
+          current_line = history_nav == input_history.size()
+                             ? nav_snapshot  // Restore in-progress line.
+                             : input_history[history_nav];
+          cursor_pos = current_line.size();
+        }
+        break;
+      case 'C':  // Right.
+        if (cursor_pos < current_line.size())
+          cursor_pos++;
+        break;
+      case 'D':  // Left.
+        if (cursor_pos > 0)
+          cursor_pos--;
+        break;
+      case 'H':  // Home.
+      case '1':  // Home on some terminals: "1~".
+        cursor_pos = 0;
+        break;
+      case 'F':  // End.
+      case '4':  // End on some terminals: "4~".
+        cursor_pos = current_line.size();
+        break;
+      case '3':  // Delete key: "3~".
+        if (cursor_pos < current_line.size())
+          current_line.erase(cursor_pos, 1);
+        break;
+      default:
+        return false;
+    }
+  } else if (c == 127) {  // Backspace
+    if (cursor_pos > 0)
+      current_line.erase(--cursor_pos, 1);
+  } else if (c == 9) {  // Tab: complete commands / file paths.
+    tab_complete();
+    return false;  // tab_complete redraws when it changes anything.
+  } else if (c == 1) {  // Ctrl+A: home.
+    cursor_pos = 0;
+  } else if (c == 5) {  // Ctrl+E: end.
+    cursor_pos = current_line.size();
+  } else if (c == 21) {  // Ctrl+U: clear whole line.
+    current_line.clear();
+    cursor_pos = 0;
+  } else if (c == 11) {  // Ctrl+K: kill to end of line.
+    current_line.erase(cursor_pos);
+  } else if (c == 23) {  // Ctrl+W: delete the word before the cursor.
+    size_t end = cursor_pos;
+    while (end > 0 && isspace((unsigned char)current_line[end - 1]))
+      end--;
+    size_t start = end;
+    while (start > 0 && !isspace((unsigned char)current_line[start - 1]))
+      start--;
+    current_line.erase(start, cursor_pos - start);
+    cursor_pos = start;
+  } else if (c == 12) {  // Ctrl+L: clear screen and repaint.
+    std::cout << "\x1b[2J\x1b[3J\x1b[H";
+  } else if (!iscntrl((unsigned char)c)) {
+    current_line.insert(cursor_pos++, 1, c);
+  } else {
+    // Any other control byte (Ctrl+C, Ctrl+D, ...): swallowed so it can
+    // neither crash the loop nor corrupt the line buffer.
+    return false;
+  }
+  redraw_line();
+  return false;
+}
+
+// ----------------------------------------------------------------------------
+// Entry point
+// ----------------------------------------------------------------------------
 
 int main(int argc, char const* argv[]) {
   if (argc != 3) {
@@ -479,161 +958,53 @@ int main(int argc, char const* argv[]) {
   }
 
   // Parse self listening address from argv[1]
-  std::string self_addr_str = argv[1];
-  std::string tracker_info_path = argv[2];
-  std::string self_ip;
-  std::string self_port_str;
-  int self_port;
-
+  const std::string self_addr_str = argv[1];
   size_t colon_pos_self = self_addr_str.find(':');
   if (colon_pos_self == std::string::npos) {
     log_error("Invalid listening address format. Use IP:PORT");
     return 1;
   }
-  self_ip = self_addr_str.substr(0, colon_pos_self);
-  self_port_str = self_addr_str.substr(colon_pos_self + 1);
+  const std::string self_ip = self_addr_str.substr(0, colon_pos_self);
+  g_self_port = self_addr_str.substr(colon_pos_self + 1);
+  int self_port = 0;
   try {
-    self_port = std::stoi(self_port_str);
+    self_port = std::stoi(g_self_port);
   } catch (const std::exception&) {
-    log_error("Invalid port number: '", self_port_str, "'");
+    log_error("Invalid port number: '", g_self_port, "'");
     return 1;
   }
   if (self_port <= 0 || self_port > 65535) {
     log_error("Port out of range (1-65535): ", self_port);
     return 1;
   }
+  g_self_port = std::to_string(self_port);  // Canonical form for the tracker.
 
-  // Read tracker addresses from tracker_info.txt
-  std::vector<std::string> tracker_addresses;
-  int fd = open(tracker_info_path.c_str(), O_RDONLY);
-  if (fd < 0) {
-    log_error("Could not open tracker info file: ", tracker_info_path);
+  g_tracker_fd = connect_to_primary_tracker(argv[2]);
+  if (g_tracker_fd < 0) {
     return 1;
   }
-  char buffer[1024];  // Assume tracker info file is reasonably small
-  ssize_t bytes_read = read(fd, buffer, sizeof(buffer) - 1);
-  close(fd);
-
-  if (bytes_read > 0) {
-    buffer[bytes_read] = '\0';  // Null-terminate the string
-    std::stringstream ss(buffer);
-    std::string line;
-    while (std::getline(ss, line)) {
-      if (!line.empty()) {
-        tracker_addresses.push_back(line);
-      }
-    }
-  }
-
-  if (tracker_addresses.empty()) {
-    log_error("No tracker addresses found in ", tracker_info_path);
-    return 1;
-  }
-
-  // Loop through trackers and attempt to connect (failover)
-  int sockfd = -1;
-  bool connected_to_tracker = false;
-  struct timeval timeout;
-  for (const auto& addr : tracker_addresses) {
-    sockfd = socket(AF_INET, SOCK_STREAM, 0);
-    if (sockfd < 0) {
-      perror("socket creation failed");
-      continue;
-    }
-
-    timeout.tv_sec = 2;  // 2-second timeout
-    timeout.tv_usec = 0;
-    if (setsockopt(sockfd, SOL_SOCKET, SO_RCVTIMEO, (const char*)&timeout,
-                   sizeof timeout) < 0) {
-      perror("setsockopt(SO_RCVTIMEO) failed");
-      close(sockfd);
-      continue;
-    }
-
-    if (setsockopt(sockfd, SOL_SOCKET, SO_SNDTIMEO, (const char*)&timeout,
-                   sizeof timeout) < 0) {
-      perror("setsockopt(SO_SNDTIMEO) failed");
-      close(sockfd);
-      continue;
-    }
-
-    size_t colon_pos = addr.find(':');
-    if (colon_pos == std::string::npos)
-      continue;
-    std::string tracker_ip = addr.substr(0, colon_pos);
-    int tracker_port = 0;
-    try {
-      tracker_port = std::stoi(addr.substr(colon_pos + 1));
-    } catch (const std::exception&) {
-      log_warn("Skipping malformed tracker address: ", addr);
-      close(sockfd);
-      continue;
-    }
-
-    struct sockaddr_in serv_addr;
-    serv_addr.sin_family = AF_INET;
-    serv_addr.sin_port = htons(tracker_port);
-    if (inet_pton(AF_INET, tracker_ip.c_str(), &serv_addr.sin_addr) <= 0) {
-      close(sockfd);
-      continue;
-    }
-
-    if (connect(sockfd, (struct sockaddr*)&serv_addr, sizeof(serv_addr)) == 0) {
-      std::string role_response;
-      if (receiveMessage(sockfd, role_response) &&
-          role_response == "ROLE PRIMARY") {
-        log_message("Successfully connected to PRIMARY tracker at ", addr);
-        connected_to_tracker = true;
-        break;
-      } else {
-        log_message("Could not get primary role from ", addr,
-                    ". Trying next...");
-        close(sockfd);
-      }
-    } else {
-      log_message("Could not connect to tracker at ", addr, ". Trying next...");
-      close(sockfd);
-    }
-  }
-
-  if (!connected_to_tracker) {
-    log_error("Failed to connect to any available tracker.");
-    return 1;
-  }
-
-  struct timeval operation_timeout;
-  operation_timeout.tv_sec = 5;  // 5-second timeout for commands
-  operation_timeout.tv_usec = 0;
-  setsockopt(sockfd, SOL_SOCKET, SO_RCVTIMEO, (const char*)&operation_timeout,
-             sizeof operation_timeout);
-  setsockopt(sockfd, SOL_SOCKET, SO_SNDTIMEO, (const char*)&operation_timeout,
-             sizeof operation_timeout);
 
   // Prepare Peer Server Socket with the static address
-  int peer_server_fd = socket(AF_INET, SOCK_STREAM, 0);
+  g_peer_server_fd = socket(AF_INET, SOCK_STREAM, 0);
   struct sockaddr_in peer_addr;
   peer_addr.sin_family = AF_INET;
   peer_addr.sin_port = htons(self_port);
   // Allow rebinding after a restart while old connections from this port
   // sit in TIME_WAIT (mirrors the tracker's socket setup).
   int peer_opt = 1;
-  setsockopt(peer_server_fd, SOL_SOCKET, SO_REUSEADDR, &peer_opt,
+  setsockopt(g_peer_server_fd, SOL_SOCKET, SO_REUSEADDR, &peer_opt,
              sizeof(peer_opt));
   if (inet_pton(AF_INET, self_ip.c_str(), &peer_addr.sin_addr) <= 0) {
     log_error("Invalid listening IP address provided.");
-    close(peer_server_fd);
     return 1;
   }
-
-  if (bind(peer_server_fd, (struct sockaddr*)&peer_addr, sizeof(peer_addr)) <
+  if (bind(g_peer_server_fd, (struct sockaddr*)&peer_addr, sizeof(peer_addr)) <
       0) {
     perror("bind (peer server) failed");
     log_error("Could not bind to ", self_addr_str,
               ". Is the port already in use?");
     return 1;
   }
-
-  bool is_peer_server_running = false;
 
   // Load persisted history from previous runs before the input loop starts.
   load_history();
@@ -663,620 +1034,45 @@ int main(int argc, char const* argv[]) {
   {
     std::lock_guard<std::mutex> lock(cout_mutex);
     redraw_line();
-    std::cout << std::flush;
   }
-
-  bool safe_exit = false;
 
   while (!exit_program) {
-    // Handle background task completions
-    {
-      std::lock_guard<std::mutex> lock(g_downloads_mutex);
-      for (auto it = g_downloads.begin(); it != g_downloads.end();) {
-        auto state = it->second;
+    finalize_finished_downloads();
 
-        if (state->download_complete.load()) {
-          // This download has finished. Let's process it.
-          if (state->download_successful.load()) {
-            log_message("Download of '", state->file_name,
-                        "' complete. Notifying tracker...");
-
-            char resolved_path[PATH_MAX];
-            if (realpath(state->destination_path.c_str(), resolved_path) ==
-                NULL) {
-              log_message("Error: Could not resolve downloaded file path: ",
-                          state->destination_path);
-              // Even on error, we must remove it from the download list.
-              it = g_downloads.erase(it);
-              continue;
-            }
-            std::string absolute_path = resolved_path;
-
-            // Construct the upload_file command to become a seeder.
-            std::string upload_cmd = "upload_file " + state->group_id + " " +
-                                     state->file_name + " " +
-                                     std::to_string(state->file_size) + " " +
-                                     state->concatenated_piece_hashes;
-
-            // Send the command using the main thread's safe socket.
-            std::string response;
-            if (safe_send(sockfd, upload_cmd) && safe_recv(sockfd, response)) {
-              log_tracker_response(response);
-              if (response.rfind("SUCCESS", 0) == 0) {
-                // Update local state now that the tracker has confirmed.
-                std::lock_guard<std::mutex> seed_lock(seeded_files_mutex);
-                seeded_files[state->file_name] = {absolute_path,
-                                                  state->file_size};
-                save_metadata_file(current_user_id, state->group_id,
-                                   state->file_name, absolute_path,
-                                   state->file_size,
-                                   state->concatenated_piece_hashes);
-              }
-            }
-          } else {
-            log_message("Download of '", state->file_name,
-                        "' failed verification.");
-            // Inform the tracker that we are no longer leeching this file
-            std::string stop_leeching_cmd =
-                "stop_leeching " + state->group_id + " " + state->file_name;
-            safe_send(sockfd, stop_leeching_cmd);
-          }
-
-          // The download is processed, remove it from the active downloads
-          // map.
-          it = g_downloads.erase(it);
-
-        } else {
-          // This download is still in progress, move to the next one.
-          ++it;
-        }
-      }
-    }
-
-    fd_set read_fds;
-    FD_ZERO(&read_fds);
-    FD_SET(STDIN_FILENO, &read_fds);
-
-    struct timeval select_timeout;
-    select_timeout.tv_sec = 0;
-    select_timeout.tv_usec = 100000;  // Poll every 100ms
-
-    int activity =
-        select(STDIN_FILENO + 1, &read_fds, NULL, NULL, &select_timeout);
-
-    if (activity < 0) {
-      perror("select error");
-      break;
-    }
-
-    if (activity > 0 && FD_ISSET(STDIN_FILENO, &read_fds)) {
-      char c;
-      if (read(STDIN_FILENO, &c, 1) != 1) {
-        // Error reading from stdin, break loop
-        break;
-      }
-
-      if (c == '\n' || c == '\r') {
-        std::string command_to_process = current_line;
-        current_line.clear();
-        cursor_pos = 0;
-
-        std::stringstream ss(command_to_process);
-        std::vector<std::string> tokens;
-        std::string token;
-        while (ss >> token) {
-          tokens.push_back(token);
-        }
-        if (tokens.empty()) {
-          std::lock_guard<std::mutex> lock(cout_mutex);
-          redraw_line();
-          continue;  // Whitespace-only input.
-        }
-
-        // Remember the command (dedup consecutive duplicates like bash) in
-        // memory and in the history file so it survives restarts.
-        record_command(command_to_process);
-
-        std::string command = tokens[0];
-
-        if (command == "clear" || command == "cls") {
-          std::lock_guard<std::mutex> lock(cout_mutex);
-          std::cout << "\x1b[2J\x1b[3J\x1b[H" << std::flush;
-          redraw_line();
-          continue;
-        }
-
-        log_message(ui::styled(ui::DIM, "ran: "), command_to_process);
-
-        if (command == "quit" || command == "exit") {
-          exit_program = true;
-          safe_exit = true;
-          break;
-        }
-
-        if (command == "help" || command == "?") {
-          print_help();
-          continue;
-        }
-
-        bool should_send = true;
-        std::string response;
-
-          // Guard every per-command token access below: a malformed command
-          // must print usage, never crash the CLI or skip state updates.
-          auto has_args = [&](size_t n) {
-            if (tokens.size() < n) {
-              log_warn("Usage: ", command, " is missing arguments (expected ",
-                       n - 1, "). Type 'help' for command list.");
-              should_send = false;
-              return false;
-            }
-            return true;
-          };
-
-          // Argument and Authentication Pre-Checks
-          if (command != "create_user" && command != "login") {
-            if (!is_logged_in.load()) {
-              log_error("You must be logged in to use this command.");
-              should_send = false;
-            }
-          }
-
-          if (command == "login" && should_send) {
-            command_to_process += " " + self_port_str;
-          } else if (command == "upload_file") {
-            should_send = false;  // Handled specially
-            if (!is_logged_in.load()) {
-              log_error("You must be logged in to upload a file.");
-            } else if (!has_args(3)) {
-              // Usage hint already printed by has_args.
-            } else {
-              std::string group_id = tokens[1];
-              std::string user_provided_path = tokens[2];
-
-              // The logical name is the part of the path after the last '/'
-              std::string logical_name = user_provided_path;
-              size_t last_slash = logical_name.find_last_of('/');
-              if (last_slash != std::string::npos) {
-                logical_name = logical_name.substr(last_slash + 1);
-              }
-
-              // Convert the user-provided path to an absolute path for local
-              // storage.
-              char resolved_path[PATH_MAX];
-              if (realpath(user_provided_path.c_str(), resolved_path) == NULL) {
-                log_error("Cannot find or resolve file path: ",
-                            user_provided_path);
-                continue;
-              }
-              std::string absolute_path = resolved_path;
-
-              try {
-                log_message("Sharing file: ", logical_name, "...");
-                FileHashes hashes = compute_hashes(absolute_path);
-                log_message("File size: ", hashes.file_size, " bytes");
-
-                std::string upload_cmd = "upload_file " + group_id + " " +
-                                         logical_name + " " +
-                                         std::to_string(hashes.file_size) +
-                                         " " + hashes.concatenated_hashes;
-
-                if (!safe_send(sockfd, upload_cmd))
-                  continue;
-                if (!safe_recv(sockfd, response))
-                  continue;
-                log_tracker_response(response);
-                if (response.rfind("SUCCESS", 0) == 0) {
-                  std::lock_guard<std::mutex> lock(seeded_files_mutex);
-                  seeded_files[logical_name] = {absolute_path,
-                                                hashes.file_size};
-
-                  // Save metadata LOCALLY with the ABSOLUTE path.
-                  save_metadata_file(current_user_id, group_id, logical_name,
-                                     absolute_path, hashes.file_size,
-                                     hashes.concatenated_hashes);
-                }
-              } catch (const std::exception& e) {
-                log_error("Hashing failed: ", e.what());
-              }
-            }
-          } else if (command == "show_downloads") {
-            should_send = false;
-            std::lock_guard<std::mutex> lock(g_downloads_mutex);
-            if (g_downloads.empty()) {
-              log_message("No downloads to show.");
-            } else {
-              for (const auto& pair : g_downloads) {
-                auto state = pair.second;
-                if (state->download_complete.load()) {
-                  if (state->download_successful.load()) {
-                    log_message("[C] [", state->group_id, "] ",
-                                state->file_name);
-                  } else {
-                    log_message("[E] [", state->group_id, "] ",
-                                state->file_name, " (Verification Failed)");
-                  }
-                } else {
-                  log_message("[D] [", state->group_id, "] ", state->file_name,
-                              " (", state->downloaded_piece_count.load(), "/",
-                              state->num_pieces, ")");
-                }
-              }
-            }
-          } else if (command == "download_file") {
-            should_send = false;
-            if (!is_logged_in.load()) {
-              log_error("You must be logged in to download a file.");
-            } else if (tokens.size() != 4 && tokens.size() != 5) {
-              log_warn(
-                    "Usage: download_file <group_id> <file_name> "
-                    "<destination_path> [algorithm]");
-            } else {
-              std::string tracker_command =
-                  tokens[0] + " " + tokens[1] + " " + tokens[2];
-              if (!safe_send(sockfd, tracker_command))
-                continue;
-              if (!safe_recv(sockfd, response))
-                continue;
-
-              if (response.rfind("SUCCESS", 0) == 0) {
-                // Parse the response without stream-extraction on the whole
-                // string: the hash blob can legitimately contain embedded
-                // characters that confuse >> tokenization. Format is
-                // "SUCCESS: <file_size> <hashes> [peer ...]".
-                size_t body_start = response.find(':');
-                body_start = (body_start == std::string::npos)
-                                 ? std::string::npos
-                                 : response.find_first_not_of(' ',
-                                                              body_start + 1);
-                size_t size_end = (body_start == std::string::npos)
-                                      ? std::string::npos
-                                      : response.find(' ', body_start);
-                size_t hashes_start = (size_end == std::string::npos)
-                                          ? std::string::npos
-                                          : size_end + 1;
-                size_t hashes_end = (hashes_start == std::string::npos)
-                                        ? std::string::npos
-                                        : response.find(' ', hashes_start);
-
-                long long file_size = -1;
-                std::string all_hashes;
-                bool parse_ok = false;
-                if (body_start != std::string::npos &&
-                    size_end != std::string::npos &&
-                    hashes_end != std::string::npos) {
-                  try {
-                    file_size = std::stoll(
-                        response.substr(body_start, size_end - body_start));
-                    all_hashes = response.substr(hashes_start,
-                                                 hashes_end - hashes_start);
-                    parse_ok = (file_size >= 0 &&
-                                all_hashes.length() % 40 == 0);
-                  } catch (const std::exception&) {
-                    parse_ok = false;
-                  }
-                }
-
-                if (!parse_ok) {
-                  log_error("Malformed download response from tracker: ", response);
-                  continue;
-                }
-
-                std::vector<std::string> peers_list;
-                std::string peer_addr;
-                std::stringstream peers_ss(response.substr(hashes_end + 1));
-                while (peers_ss >> peer_addr) {
-                  peers_list.push_back(peer_addr);
-                }
-                if (peers_list.empty()) {
-                  log_warn("No seeders found for this file.");
-                } else {
-                  std::string group_id = tokens[1];
-                  std::string file_name = tokens[2];
-                  std::string destination_path = tokens[3];
-                  std::string algorithm = "rarest";
-
-                  // Refuse a second concurrent download of the same file:
-                  // the g_downloads map is keyed by file name, so a new
-                  // state would orphan the old one (both writing to the
-                  // same destination path).
-                  {
-                    std::lock_guard<std::mutex> lock(g_downloads_mutex);
-                    auto existing = g_downloads.find(file_name);
-                    if (existing != g_downloads.end() &&
-                        !existing->second->download_complete.load()) {
-                      log_error("A download of '", file_name,
-                        "' is already in progress on this client.");
-                      continue;
-                    }
-                  }
-
-                  if (tokens.size() == 5) {
-                    algorithm = tokens[4];
-                  }
-
-                  auto state = std::make_shared<DownloadState>();
-                  state->group_id = group_id;
-                  state->file_name = file_name;
-                  state->destination_path = destination_path;
-                  state->file_size = file_size;
-                  state->concatenated_piece_hashes = all_hashes;
-                  state->algorithm = algorithm;
-                  state->num_pieces =
-                      std::ceil(static_cast<double>(file_size) / PIECE_SIZE);
-
-                  for (size_t i = 0; i < all_hashes.length(); i += 40) {
-                    state->piece_hashes.push_back(all_hashes.substr(i, 40));
-                  }
-
-                  // Cross-check the two independent sources for the piece
-                  // count: file_size/PIECE_SIZE vs. hash entries (40 hex
-                  // chars each). A mismatch means the tracker response was
-                  // truncated or corrupted; refuse the download rather than
-                  // risk an out-of-bounds piece index later.
-                  if (state->piece_hashes.size() !=
-                      static_cast<size_t>(state->num_pieces)) {
-                    log_error(
-                      "Hash count mismatch for ", file_name, " (",
-                      state->piece_hashes.size(), " hashes for ",
-                      state->num_pieces,
-                      " pieces). Tracker metadata is corrupt; aborting.");
-                    continue;
-                  }
-
-                  for (const auto& peer_addr : peers_list) {
-                    state->peers.emplace_back(peer_addr);
-                  }
-                  state->pieces_we_have.assign(state->num_pieces, false);
-                  state->pieces_in_progress.assign(state->num_pieces, false);
-                  state->pieces_exhausted.assign(state->num_pieces, false);
-                  state->piece_failures.assign(state->num_pieces, 0);
-                  state->piece_rarity.assign(state->num_pieces, 0);
-
-                  {
-                    std::lock_guard<std::mutex> lock(g_downloads_mutex);
-                    g_downloads[file_name] = state;
-                  }
-
-                  save_metadata_file(current_user_id, group_id, file_name,
-                                     destination_path, file_size, all_hashes);
-
-                  std::string start_leeching_cmd =
-                      "start_downloading " + group_id + " " + file_name;
-                  log_message(
-                      "[Client] Notifying tracker: starting download of ",
-                      file_name);
-
-                  safe_send(sockfd, start_leeching_cmd);
-
-                  std::string start_leeching_response;
-                  if (safe_recv(sockfd, start_leeching_response)) {
-                    log_tracker_response(start_leeching_response);
-                  }
-
-                  std::thread download_thread(start_download, state);
-                  download_thread.detach();
-                }
-              } else {
-                // The command failed, just log the tracker's error message.
-                log_tracker_response(response);
-              }
-            }
-          }
-
-          // Default path for all other commands
-          if (should_send) {
-            if (!safe_send(sockfd, command_to_process))
-              continue;
-            if (!safe_recv(sockfd, response))
-              continue;
-            log_tracker_response(response);
-
-            if (command == "login" && response.rfind("SUCCESS", 0) == 0) {
-              if (!has_args(2)) {
-                continue;  // Tracker accepted but our usage is wrong.
-              }
-              is_logged_in.store(true);
-              current_user_id = tokens[1];
-
-              std::string app_home = get_application_home();
-              std::string p2pclient = app_home + "/.p2p_client";
-              std::string p2pclientUser = p2pclient + "/users";
-              std::string user_dir =
-                  app_home + "/.p2p_client/users/" + current_user_id;
-              mkdir(p2pclient.c_str(), 0755);
-              mkdir(p2pclientUser.c_str(), 0755);
-              mkdir(user_dir.c_str(), 0755);
-
-              load_state_from_disk(current_user_id);
-
-              if (!is_peer_server_running) {
-                std::thread peer_server_thread(run_peer_server_loop,
-                                               peer_server_fd);
-                peer_server_thread.detach();
-                is_peer_server_running = true;
-              }
-            } else if (command == "logout" &&
-                       response.rfind("SUCCESS", 0) == 0) {
-              is_logged_in.store(false);
-              std::lock_guard<std::mutex> lock(seeded_files_mutex);
-              seeded_files.clear();
-              log_debug("[Seeder Sync] Cleared seeded file state on logout");
-            } else if (command == "stop_share" &&
-                       response.rfind("SUCCESS", 0) == 0) {
-              if (!has_args(3)) {
-                continue;
-              }
-              std::string group_id = tokens[1];
-              std::string file_name_to_stop = tokens[2];
-              std::string app_home = get_application_home();
-              if (!app_home.empty()) {
-                std::string meta_file_path = app_home + "/.p2p_client/users/" +
-                                             current_user_id + "/" + group_id +
-                                             "_" + file_name_to_stop + ".meta";
-                if (std::remove(meta_file_path.c_str()) != 0) {
-                  log_error("Could not delete metadata file: ",
-                              meta_file_path);
-                } else {
-                  log_debug("[State] Deleted metadata for ",
-                              file_name_to_stop);
-                }
-              }
-              std::lock_guard<std::mutex> lock(seeded_files_mutex);
-              seeded_files.erase(file_name_to_stop);
-            }
-          }
-        } else if (c == 127) {  // Backspace
-        if (cursor_pos > 0) {
-          current_line.erase(cursor_pos - 1, 1);
-          cursor_pos--;
-          std::lock_guard<std::mutex> lock(cout_mutex);
-          redraw_line();
-        }
-      } else if (c == 27) {  // ESC: escape sequence (arrows, Home/End, Del)
-        char seq[2];
-        if (read(STDIN_FILENO, &seq[0], 1) != 1) continue;
-        if (read(STDIN_FILENO, &seq[1], 1) != 1) continue;
-
-        if (seq[0] == '[') {
-          std::lock_guard<std::mutex> lock(cout_mutex);
-          if (seq[1] == 'A') {  // Up: older history entry.
-            if (!input_history.empty() && history_nav > 0) {
-              if (history_nav == input_history.size())
-                nav_snapshot = current_line;  // Remember in-progress line.
-              history_nav--;
-              current_line = input_history[history_nav];
-              cursor_pos = current_line.size();
-              redraw_line();
-            }
-          } else if (seq[1] == 'B') {  // Down: newer history entry.
-            if (history_nav < input_history.size()) {
-              history_nav++;
-              if (history_nav == input_history.size()) {
-                current_line = nav_snapshot;  // Restore in-progress line.
-              } else {
-                current_line = input_history[history_nav];
-              }
-              cursor_pos = current_line.size();
-              redraw_line();
-            }
-          } else if (seq[1] == 'C') {  // Right.
-            if (cursor_pos < current_line.size()) {
-              cursor_pos++;
-              redraw_line();
-            }
-          } else if (seq[1] == 'D') {  // Left.
-            if (cursor_pos > 0) {
-              cursor_pos--;
-              redraw_line();
-            }
-          } else if (seq[1] == 'H') {  // Home.
-            cursor_pos = 0;
-            redraw_line();
-          } else if (seq[1] == 'F') {  // End.
-            cursor_pos = current_line.size();
-            redraw_line();
-          } else if (seq[1] == '3') {  // Delete key: '3' + '~'.
-            char tilde;
-            if (read(STDIN_FILENO, &tilde, 1) == 1 && tilde == '~') {
-              if (cursor_pos < current_line.size()) {
-                current_line.erase(cursor_pos, 1);
-                redraw_line();
-              }
-            }
-          } else if (seq[1] == '1') {  // Home on some terminals: '1' + '~'.
-            char tilde;
-            if (read(STDIN_FILENO, &tilde, 1) == 1 && tilde == '~') {
-              cursor_pos = 0;
-              redraw_line();
-            }
-          } else if (seq[1] == '4') {  // End on some terminals: '4' + '~'.
-            char tilde;
-            if (read(STDIN_FILENO, &tilde, 1) == 1 && tilde == '~') {
-              cursor_pos = current_line.size();
-              redraw_line();
-            }
-          }
-        }
-        // Any other escape sequence: ignored (never crashes, never leaks
-        // bytes into the command line).
-      } else if (c == 9) {  // Tab: complete commands / file paths.
-        std::lock_guard<std::mutex> lock(cout_mutex);
-        tab_complete();
-      } else if (c == 1) {  // Ctrl+A: home.
-        cursor_pos = 0;
-        std::lock_guard<std::mutex> lock(cout_mutex);
-        redraw_line();
-      } else if (c == 5) {  // Ctrl+E: end.
-        cursor_pos = current_line.size();
-        std::lock_guard<std::mutex> lock(cout_mutex);
-        redraw_line();
-      } else if (c == 21) {  // Ctrl+U: clear whole line.
-        current_line.clear();
-        cursor_pos = 0;
-        std::lock_guard<std::mutex> lock(cout_mutex);
-        redraw_line();
-      } else if (c == 11) {  // Ctrl+K: kill to end of line.
-        current_line.erase(cursor_pos);
-        std::lock_guard<std::mutex> lock(cout_mutex);
-        redraw_line();
-      } else if (c == 23) {  // Ctrl+W: delete the word before the cursor.
-        size_t end = cursor_pos;
-        while (end > 0 && isspace((unsigned char)current_line[end - 1])) end--;
-        size_t start = end;
-        while (start > 0 && !isspace((unsigned char)current_line[start - 1]))
-          start--;
-        if (start < end) {
-          current_line.erase(start, end - start);
-          cursor_pos = start;
-        }
-        std::lock_guard<std::mutex> lock(cout_mutex);
-        redraw_line();
-      } else if (c == 12) {  // Ctrl+L: clear screen and repaint.
-        std::lock_guard<std::mutex> lock(cout_mutex);
-        std::cout << "\x1b[2J\x1b[3J\x1b[H" << std::flush;
-        redraw_line();
-      } else if (!iscntrl(c)) {
-        current_line.insert(cursor_pos, 1, c);
-        cursor_pos++;
-        std::lock_guard<std::mutex> lock(cout_mutex);
-        redraw_line();
-      } else {
-        // Any other control byte (Ctrl+C/Ctrl+D flow control, tab, etc.):
-        // swallowed here so it can neither crash the loop nor corrupt the
-        // line buffer.
-        continue;
-      }
+    char c;
+    int got_key = read_key(c, 100);  // Poll every 100ms
+    if (got_key < 0)
+      break;  // stdin closed or failed.
+    std::string line;
+    if (got_key == 1 && handle_key(c, line)) {
+      process_command(line);
     }
   }
 
-  if (is_logged_in.load()) {
+  if (is_logged_in.load() && !g_tracker_lost) {
     log_message("[Client] Cleaning up active downloads before exit...");
     std::lock_guard<std::mutex> lock(g_downloads_mutex);
     for (const auto& pair : g_downloads) {
-      auto state = pair.second;
+      const auto& state = pair.second;
       // We only care about downloads that are not yet complete
       if (!state->download_complete.load()) {
         log_message("[Client] Notifying tracker: stopping leech of ",
                     state->file_name);
-        std::string stop_leeching_cmd =
-            "stop_leeching " + state->group_id + " " + state->file_name;
-        sendMessage(sockfd, stop_leeching_cmd);
+        sendMessage(g_tracker_fd, "stop_leeching " + state->group_id + " " +
+                                      state->file_name);
       }
     }
   }
 
   disable_raw_mode();
   std::cout << "\r\x1b[K";
-  if (!safe_exit) {
+  if (g_tracker_lost) {
     std::cout << "[Connection Error] : Connection lost with Primary. Please "
                  "restart client to connect again]"
               << std::endl;
   }
   std::cout << "[Client shutting down.]" << std::endl;
-  if (sockfd >= 0)
-    close(sockfd);
-  if (peer_server_fd >= 0)
-    close(peer_server_fd);
+  close(g_tracker_fd);
+  close(g_peer_server_fd);
   return 0;
 }

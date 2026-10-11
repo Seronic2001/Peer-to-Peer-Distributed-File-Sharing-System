@@ -83,9 +83,9 @@ TEST(compute_hashes_small_file_single_piece) {
 
   TEST_ASSERT_EQ(h.file_size, (long long)15);
   TEST_ASSERT_EQ(h.piece_hashes.size(), (size_t)1);
-  // The single piece hash equals the full-file hash for files < PIECE_SIZE.
-  TEST_ASSERT_EQ(h.piece_hashes[0], h.full_file_hash);
-  TEST_ASSERT_EQ(h.concatenated_hashes, h.full_file_hash);
+  // A file smaller than PIECE_SIZE is one piece covering all of its bytes.
+  TEST_ASSERT_EQ(h.piece_hashes[0], hash_buffer("hello p2p world", 15));
+  TEST_ASSERT_EQ(h.concatenated_hashes, h.piece_hashes[0]);
 }
 
 TEST(compute_hashes_exact_multiple_of_piece_size) {
@@ -99,9 +99,6 @@ TEST(compute_hashes_exact_multiple_of_piece_size) {
   TEST_ASSERT_EQ(h.file_size, (long long)(2 * PIECE_SIZE));
   TEST_ASSERT_EQ(h.piece_hashes.size(), (size_t)2);
   TEST_ASSERT_EQ(h.concatenated_hashes.size(), (size_t)80);  // 2 * 40 hex
-
-  // Full-file hash must match an in-memory hash of the same bytes.
-  TEST_ASSERT_EQ(h.full_file_hash, hash_buffer(content.data(), content.size()));
 
   // Piece i must equal the hash of that slice of the content.
   TEST_ASSERT_EQ(h.piece_hashes[0],
@@ -120,7 +117,6 @@ TEST(compute_hashes_partial_final_piece) {
   TEST_ASSERT_EQ(h.piece_hashes.size(), (size_t)2);
   TEST_ASSERT_EQ(h.piece_hashes[1],
                  hash_buffer(content.data() + PIECE_SIZE, PIECE_SIZE / 2));
-  TEST_ASSERT_EQ(h.full_file_hash, hash_buffer(content.data(), content.size()));
 }
 
 TEST(compute_hashes_empty_file) {
@@ -130,8 +126,6 @@ TEST(compute_hashes_empty_file) {
   TEST_ASSERT_EQ(h.file_size, (long long)0);
   TEST_ASSERT(h.piece_hashes.empty());
   TEST_ASSERT(h.concatenated_hashes.empty());
-  TEST_ASSERT_EQ(h.full_file_hash,
-                 "da39a3ee5e6b4b0d3255bfef95601890afd80709");
 }
 
 TEST(compute_hashes_missing_file_throws) {

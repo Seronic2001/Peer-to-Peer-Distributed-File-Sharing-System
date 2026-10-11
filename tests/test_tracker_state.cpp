@@ -100,28 +100,50 @@ TEST(join_request_duplicates_and_nonexistent_group) {
               0);  // owner already member
 }
 
-TEST(upload_file_requires_membership_and_peer_address) {
+TEST(upload_file_requires_membership) {
   TrackerState s;
   s.handle_create_user("seeder", "p");
   s.handle_create_user("outsider", "p");
-  s.handle_login("seeder", "p");
   s.handle_create_group("g", "seeder");
 
-  // Not a member yet: upload must fail even with an address.
-  s.add_peer_address("outsider", "1.2.3.4:1000");
   TEST_ASSERT(s.handle_upload_file("g", "f.bin", 10, std::string(40, '0'),
                                    "outsider")
                   .rfind("ERROR", 0) == 0);
-
-  // Member but no peer address: upload must fail.
-  TEST_ASSERT(s.handle_upload_file("g", "f.bin", 10, std::string(40, '0'),
-                                   "seeder")
-                  .rfind("ERROR", 0) == 0);
-
-  s.add_peer_address("seeder", "5.6.7.8:2000");
   TEST_ASSERT(s.handle_upload_file("g", "f.bin", 10, std::string(40, '0'),
                                    "seeder")
                   .rfind("SUCCESS", 0) == 0);
+}
+
+TEST(upload_file_rejects_different_content_under_same_name) {
+  TrackerState s;
+  s.handle_create_user("a", "p");
+  s.handle_create_user("b", "p");
+  s.handle_create_group("g", "a");
+  s.handle_join_group("g", "b");
+  s.handle_accept_request("g", "b", "a");
+
+  const std::string original(40, '1');
+  const std::string other(40, '2');
+  TEST_ASSERT(s.handle_upload_file("g", "f", 10, original, "a")
+                  .rfind("SUCCESS", 0) == 0);
+  // Same name, different hashes or size: b must not join a's swarm.
+  TEST_ASSERT(s.handle_upload_file("g", "f", 10, other, "b")
+                  .rfind("ERROR", 0) == 0);
+  TEST_ASSERT(s.handle_upload_file("g", "f", 11, original, "b")
+                  .rfind("ERROR", 0) == 0);
+  // Identical content: b becomes a second seeder.
+  TEST_ASSERT(s.handle_upload_file("g", "f", 10, original, "b")
+                  .rfind("SUCCESS", 0) == 0);
+
+  // Once nobody seeds the old content, the name can be reused.
+  s.handle_stop_share("g", "f", "a");
+  s.handle_stop_share("g", "f", "b");
+  TEST_ASSERT(s.handle_upload_file("g", "f", 10, other, "b")
+                  .rfind("SUCCESS", 0) == 0);
+  s.handle_login("b", "p");
+  s.add_peer_address("b", "1.2.3.4:1000");
+  TEST_ASSERT(s.handle_download_file("g", "f", "a").find(other) !=
+              std::string::npos);
 }
 
 TEST(leecher_lifecycle_and_download_peer_list) {
@@ -230,10 +252,8 @@ TEST(replication_replay_matches_primary_operations) {
 
   TEST_ASSERT(primary.handle_login("u1", "p1").rfind("SUCCESS", 0) == 0);
   primary.add_peer_address("u1", "9.9.9.9:9000");
-  // The live forwarder replicates logins with a placeholder port: the backup
-  // has no client socket and cannot learn the peer IP. Addresses are
-  // session-local by design and are wiped on promotion (clear_sessions).
-  backup.process_replicated_command("login u1 p1 0");
+  // Logins are not replicated: sessions and peer addresses belong to the
+  // primary that holds the client connections.
 
   TEST_ASSERT(primary.handle_create_group("g1", "u1").rfind("SUCCESS", 0) == 0);
   backup.process_replicated_command("create_group g1 u1");
@@ -270,7 +290,7 @@ TEST(replication_replay_matches_primary_operations) {
                  metadata_prefix(backup.handle_download_file("g1", "f.bin", "u2")));
 
   // Session state must NOT be mirrored: the primary knows the real peer
-  // address, the backup only has the placeholder.
+  // address, the backup knows none.
   TEST_ASSERT(primary.handle_download_file("g1", "f.bin", "u2")
                   .find("9.9.9.9:9000") != std::string::npos);
   TEST_ASSERT(backup.handle_download_file("g1", "f.bin", "u2")
@@ -284,7 +304,7 @@ TEST(replication_ignores_malformed_commands_without_crashing) {
   s.process_replicated_command("   ");
   s.process_replicated_command("create_user");
   s.process_replicated_command("create_user onlyone");
-  s.process_replicated_command("login u p");          // missing port
+  s.process_replicated_command("login u p 0");        // sessions not replicated
   s.process_replicated_command("upload_file g f x");  // too few tokens
   s.process_replicated_command(
       "upload_file g f NOT_A_NUMBER abc u");  // non-numeric size

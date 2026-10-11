@@ -9,8 +9,6 @@
 //   * log_error(...)    -> failures. Always shown (red). Never crashes.
 //   * log_debug(...)    -> protocol/peer chatter. Only compiled in when
 //                          P2P_LOG_LEVEL >= LOG_DEBUG (make debug).
-//   * ui_info()/ui_error()/ui_hint() -> pre-colored single-line helpers for
-//                          the interactive prompt path.
 //
 // Release builds (make release) set P2P_LOG_LEVEL=LOG_INFO by default:
 // debug chatter is compiled out entirely (zero cost) and only the necessary
@@ -66,7 +64,7 @@ enum class Level { Error = 0, Warn = 1, Info = 2, Debug = 3 };
 // Core emitter: serializes, prints above the prompt line, redraws input.
 // Never throws and never exits the process.
 template <typename... Args>
-void emit(Level level, const char* color, const char* tag, Args... args) {
+void emit(Level level, const char* tag, Args... args) {
   std::stringstream ss;
   (ss << ... << args);
 
@@ -86,7 +84,6 @@ void emit(Level level, const char* color, const char* tag, Args... args) {
       out = ss.str();
       break;
   }
-  (void)color;
 
   std::lock_guard<std::mutex> lock(cout_mutex);
   if (!raw_mode_active.load()) {
@@ -109,68 +106,43 @@ void emit(Level level, const char* color, const char* tag, Args... args) {
   std::cout << std::flush;
 }
 
-// Convenience helpers used across the client.
-template <typename... Args>
-void ui_info(const std::string& msg) {
-  emit(Level::Info, CYAN, "", msg);
-}
-
 }  // namespace ui
 
 // ----- user-facing output (was: everything through log_message) -----
 template <typename... Args>
 void log_message(Args... args) {
-  ui::emit(ui::Level::Info, ui::CYAN, "", args...);
+  ui::emit(ui::Level::Info, "", args...);
 }
 
 // ----- successes: green so they pop (login OK, upload OK, download done) -----
 template <typename... Args>
 void log_success(Args... args) {
-  ui::emit(ui::Level::Info, ui::GREEN, "", args...);
+  ui::emit(ui::Level::Info, "", ui::GREEN, args..., ui::RESET);
 }
 
 // ----- warnings: recoverable issues the user should notice -----
 template <typename... Args>
 void log_warn(Args... args) {
-  ui::emit(ui::Level::Warn, ui::YELLOW, "[warn]", args...);
+  ui::emit(ui::Level::Warn, "[warn]", args...);
 }
 
 // ----- errors: failures; never crash the CLI -----
 template <typename... Args>
 void log_error(Args... args) {
-  ui::emit(ui::Level::Error, ui::RED, "[error]", args...);
+  ui::emit(ui::Level::Error, "[error]", args...);
 }
 
 // ----- debug chatter: compiled out in release builds -----
 #if P2P_LOG_LEVEL >= LOG_DEBUG
 template <typename... Args>
 void log_debug(Args... args) {
-  ui::emit(ui::Level::Debug, ui::DIM, "[debug]", args...);
+  ui::emit(ui::Level::Debug, "[debug]", args...);
 }
 #else
 #define log_debug(...) ((void)0)
 #endif
 
 namespace ui {
-
-// Visible character count of a string, skipping ANSI escape sequences.
-// Used to place the cursor after a colored prompt.
-inline size_t visible_len(const std::string& s) {
-  size_t width = 0;
-  bool in_escape = false;
-  for (char c : s) {
-    if (in_escape) {
-      if (c == 'm' || c == 'K' || c == 'J' || c == 'H') in_escape = false;
-      continue;
-    }
-    if (c == '\x1b') {
-      in_escape = true;
-      continue;
-    }
-    ++width;
-  }
-  return width;
-}
 
 inline std::string bold_color(const char* color, const std::string& text) {
   return std::string(BOLD) + color + text + RESET;

@@ -100,9 +100,10 @@ std::string TrackerState::handle_leave_group(const std::string& group_id,
   // Remove the user from the members set first.
   group.members.erase(user_id);
 
-  // Also remove the user as a seeder from all files within this group.
+  // Also remove the user as a peer of all files within this group.
   for (auto& file_pair : group.files) {
     file_pair.second.seeders.erase(user_id);
+    file_pair.second.leechers.erase(user_id);
   }
 
   // Check if the group is now empty.
@@ -176,23 +177,28 @@ std::string TrackerState::handle_upload_file(const std::string& group_id,
     return "ERROR: You are not a member of this group.";
   }
 
-  if (!users.count(user_id) || users[user_id].peer_address.empty()) {
-    return "ERROR: Could not find your peer address. Please log in again.";
-  }
-
   auto& group_files = groups[group_id].files;
-
-  // When a user becomes a seeder, they are no longer a leecher.
-  if (group_files.count(file_name)) {
-    group_files[file_name].leechers.erase(user_id);
-    group_files[file_name].seeders.insert(user_id);
-  } else {
-    FileMetadata meta;
-    meta.file_size = file_size;
-    meta.concatenated_hashes = hashes;
-    meta.seeders.insert(user_id);
-    group_files[file_name] = meta;
+  auto it = group_files.find(file_name);
+  if (it != group_files.end() && (it->second.file_size != file_size ||
+                                  it->second.concatenated_hashes != hashes)) {
+    // Same name, different content. Peers of the existing file would fail
+    // verification against this copy, so it cannot join their swarm. Once
+    // nobody seeds the old content any more, the name is free to be reused.
+    if (!it->second.seeders.empty()) {
+      return "ERROR: A different file with this name is already shared in "
+             "this group.";
+    }
+    group_files.erase(it);
+    it = group_files.end();
   }
+
+  if (it == group_files.end()) {
+    it = group_files.emplace(file_name, FileMetadata{file_size, hashes, {}, {}})
+             .first;
+  }
+  // When a user becomes a seeder, they are no longer a leecher.
+  it->second.leechers.erase(user_id);
+  it->second.seeders.insert(user_id);
   return "SUCCESS: File shared successfully.";
 }
 
@@ -226,14 +232,9 @@ std::string TrackerState::handle_download_file(const std::string& group_id,
     return "ERROR: File not found in this group.";
   }
 
-  const auto& file_info = group.files[file_name];
-  if (file_info.seeders.empty()) {
+  const auto& file_meta = group.files[file_name];
+  if (file_meta.seeders.empty()) {
     return "ERROR: No seeders currently available for this file.";
-  }
-
-  const auto& file_meta = groups[group_id].files[file_name];
-  if (file_meta.seeders.empty() && file_meta.leechers.empty()) {
-    return "ERROR: No peers available for this file.";
   }
 
   // Combine both seeders and leechers into one list for the client.
@@ -425,11 +426,8 @@ void TrackerState::process_replicated_command(const std::string& command_str) {
 
   if (command == "create_user" && tokens.size() == 3)
     handle_create_user(tokens[1], tokens[2]);
-  else if (command == "login" && tokens.size() == 4) {
-    handle_login(tokens[1], tokens[2]);
-    add_peer_address(tokens[1], tokens[3]);
-  } else if (command == "logout" && tokens.size() == 2)
-    handle_logout(tokens[1]);
+  // Logins and logouts are not replicated: sessions belong to the primary
+  // that holds the client connections and are reset on promotion.
   else if (command == "create_group" && tokens.size() == 3)
     handle_create_group(tokens[1], tokens[2]);
   else if (command == "join_group" && tokens.size() == 3)

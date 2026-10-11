@@ -9,7 +9,7 @@ selection strategies, partial seeding, and end-to-end SHA-1 integrity.
  ├── common/            protocol framing + SHA-1 hashing (shared by tracker & client)
  ├── tracker/           state machine, replication manager, client-facing server
  ├── client/            line-editor CLI, download manager, peer server, piece selectors
- └── tests/             48 unit tests (ASan/UBSan) + 4-scenario integration harness
+ └── tests/             46 unit tests (ASan/UBSan) + 4-scenario integration harness
 ```
 
 ---
@@ -24,7 +24,7 @@ selection strategies, partial seeding, and end-to-end SHA-1 integrity.
 | **Piece size** | 512 KB, each verified by SHA-1 before being accepted. |
 | **Concurrency** | Threaded: one worker per connected peer, scheduler thread per download, one thread per tracker client, dedicated replication thread. |
 | **Fault tolerance** | Primary/backup tracker with automatic promotion and state replication. |
-| **Verified by** | 48 dependency-free unit tests under AddressSanitizer + UBSan, plus an integration harness covering transfers, multi-peer downloads, live tracker failover, and mid-download corruption. |
+| **Verified by** | 46 dependency-free unit tests under AddressSanitizer + UBSan, plus an integration harness covering transfers, multi-peer downloads, live tracker failover, and mid-download corruption. |
 
 ---
 
@@ -85,12 +85,13 @@ Consequences of this split:
 | Process | Threads |
 |---|---|
 | **Tracker** | main accept loop (`select`, 1 s tick) · one `handle_client` thread per connected client · replication thread (election/sync/heartbeat) · console thread (`quit`) |
-| **Client** | main raw-mode input loop (`select` on stdin + tracker socket) · download orchestrator per active download · one `peer_worker` thread per remote peer · peer-server accept loop · per-download completion/upload hooks |
+| **Client** | main raw-mode input loop (`select` on stdin + tracker socket) · one download thread per active download · one self-scheduling `peer_worker` thread per remote peer · peer-server accept loop · per-download completion/upload hooks |
 
-Client-side console state (`current_user_id`, `is_logged_in`) is guarded by
-atomics; download state by a dedicated `state_mutex` plus a separate
-`file_mutex` for disk writes — lock ordering is always state → file, avoiding
-deadlock between piece bookkeeping and I/O.
+The line editor's state (`current_line`, `cursor_pos`, `current_user_id`) is
+only modified under `cout_mutex`, because background threads redraw the prompt
+when they log. Download state is guarded by a dedicated `state_mutex`; disk
+writes need no lock because `pwrite` is positional and each piece is written
+by exactly one worker.
 
 ---
 
@@ -124,7 +125,7 @@ prints these without crashing.
 
 ```
 leecher                                seeder
-  │── HANDSHAKE <file_name> ────────────▶│  (file must be known locally)
+  │── HANDSHAKE <group> <file_name> ────▶│  (file must be known locally)
   │◀───────────────────── HANDSHAKE_OK ──│
   │◀── BITFIELD <'1'/'0' per piece> ─────│  actual possession, not "all 1s"
   │── REQUEST_PIECE <idx> ──────────────▶│
@@ -155,42 +156,43 @@ runtime (`download_file <g> <f> <dest> <alg>`):
 ```cpp
 class PieceSelector {
  public:
-  virtual int select_piece(DownloadState& state) = 0;  // -1 = nothing available
+  // -1 = this peer has nothing to offer right now
+  virtual int select_piece(const DownloadState& state,
+                           const PeerState& peer) = 0;
 };
 ```
 
-Shared state every strategy consults (all under `state_mutex`):
+A strategy is always asked on behalf of one peer, so it only ever returns a
+piece that peer can serve. Shared state every strategy consults (all under
+`state_mutex`):
 
 ```
 pieces_we_have[]      acquired pieces
-pieces_in_progress[]  currently assigned to some peer
-pieces_exhausted[]    failed MAX_PIECE_ATTEMPTS (5) times — blacklisted
+pieces_in_progress[]  currently being fetched by some worker
 piece_rarity[]        count of active peers holding each piece
+peer.bitfield[]       pieces this peer can still usefully serve
 ```
 
 #### Rarest-first (default)
 
 ```
-select_piece:
-    best ← -1,  min_rarity ← |peers| + 1
-    for each piece i not in (have ∪ in_progress ∪ exhausted):
-        if rarity[i] < min_rarity:
-            if any active peer's bitfield[i]:      # must be servable now
-                min_rarity ← rarity[i],  best ← i
+select_piece(peer):
+    best ← -1
+    for each piece i in peer.bitfield, not in (have ∪ in_progress):
+        if best = -1 or rarity[i] < rarity[best]:
+            best ← i
     return best
 ```
 
-*Complexity:* O(P × S) per selection (P pieces, S peers), P ≤ file/512 KB so
-this is trivially fast in practice.
+*Complexity:* O(P) per selection (P pieces, P ≤ file/512 KB).
 
 **Why rarest-first matters** (the same reasoning as BitTorrent): the rarest
 pieces are the ones closest to disappearing if their holders leave. Downloading
 them first converts the swarm's most fragile knowledge into widely-replicated
 data. It also naturally diversifies which pieces different leechers fetch,
-increasing the number of useful partial seeders for everyone else. A final
-boundary case is handled explicitly: a piece is only returned if at least one
-*currently active* peer's bitfield actually contains it, so selection can
-never dead-end on a peer that dropped out.
+increasing the number of useful partial seeders for everyone else. Rarity
+counts only *currently active* peers: when a worker retires, its pieces are
+subtracted again.
 
 #### Sequential — `0, 1, 2, …`
 Lowest-index servable piece first. Useful for streaming-style access (early
@@ -198,73 +200,74 @@ pieces arrive in order); worst case for swarm health since every leecher
 contends for the same prefix.
 
 #### Random — uniform over servable pieces
-Available pieces are collected and shuffled (time-seeded
-`std::default_random_engine`). Good as a contention-spreading baseline and as
+One pass of reservoir sampling over the peer's candidate pieces (no
+allocation, `std::mt19937` seeded once per download). Good as a contention-spreading baseline and as
 a fuzz-ish stress input for the scheduler.
 
 Unknown algorithm names are rejected with a warning and fall back to
 rarest-first — the CLI can never be tricked into a null strategy.
 
-### 4.2 Download orchestration — a centralized work-stealing scheduler
+### 4.2 Download orchestration — self-scheduling workers
 
-`start_download` runs a coordinator loop; each connected peer runs its own
-`peer_worker` thread that sleeps on a condition variable until assigned work:
+`start_download` opens the output file, starts one `peer_worker` thread per
+peer and joins them. There is no coordinator loop: each worker schedules
+itself.
 
 ```
-start_download:                                peer_worker (per peer):
-  pick strategy                                  handshake → BITFIELD
-  open output file (O_TRUNC)                     update rarity[], go idle
-  spawn one worker thread per peer               loop:
-  wait until all workers report ready              wait(cv: assigned_piece != -1
-  while downloaded < num_pieces:                        OR download_complete)
-    for each idle active peer p:                   send REQUEST_PIECE
-      idx ← select_piece()                         receive PIECE
-      if idx servable by p:                        verify SHA-1 vs manifest
-        in_progress[idx] ← true                    pwrite(fd, data, offset)
-        p.assigned_piece ← idx                         = size → success
-    if any assignment: cv.notify_all()             else → failure path
-    else if nothing in flight anywhere: ABORT      (see below)
-    sleep(100 ms)
-  final whole-file hash verification
+peer_worker (per peer):
+  connect → HANDSHAKE → BITFIELD; rarity[i]++ for each piece the peer has
+  loop (under state_mutex):
+    wait(cv) until  select_piece(self) ≠ -1          # work for this peer
+                or  no piece this peer has is in flight elsewhere
+    if nothing selected: exit                        # peer has nothing left
+    in_progress[idx] ← true;  unlock
+    REQUEST_PIECE → PIECE → verify SHA-1 → pwrite(fd, data, offset)
+    lock;  in_progress[idx] ← false
+      ok        → have[idx] ← true, count++
+      bad hash  → peer.bitfield[idx] ← false, rarity[idx]--, strike++
+      I/O error → drop this peer
+    cv.notify_all()
+    if 3 consecutive strikes: drop this peer
+  retire: rarity[i]-- for the peer's remaining pieces; cv.notify_all()
+
+start_download:  success ⇔ downloaded == num_pieces after all workers exit
 ```
 
 Key correctness and liveness properties:
 
-* **No busy-waiting per worker** — idle peers block on a condition variable;
-  only the coordinator sleeps on a timer.
-* **Completion is progress-gated.** If `select_piece()` returns `-1` for every
-  idle peer *and* no piece is in flight, the download aborts with a clear
-  error instead of spinning forever. This is the distinction between "temporarily
-  starved (someone is still fetching)" and "permanently unservable (nobody has
-  the remaining pieces)".
-* **Writes are atomic seeks.** Pieces land via `pwrite(output_fd, data,
-  piece_index * PIECE_SIZE)` under `file_mutex` — a piece counts as downloaded
-  only if the *entire* payload reached the disk, so short writes are retried
-  rather than silently corrupting the file.
+* **No polling.** A worker picks its next piece the moment the previous one
+  finishes, so throughput is bounded by the network and SHA-1, not by a
+  scheduler tick. Idle workers block on the condition variable.
+* **Termination is progress-gated.** A worker only waits while a piece it
+  could serve is in flight on another connection (that fetch may fail and
+  free the piece). Otherwise it exits. When the last worker exits, the
+  download is over: complete if every piece arrived, failed otherwise.
+* **Bad peers cannot poison the swarm.** A dead connection ends that worker
+  at once. A piece that fails verification is never requested from that peer
+  again, and three consecutive bad pieces drop the peer, so other peers
+  supply those pieces instead.
+* **Writes are positional.** Pieces land via `pwrite(output_fd, data,
+  piece_index * PIECE_SIZE)` with no file lock — a piece counts as downloaded
+  only if the *entire* payload reached the disk.
 
-### 4.3 Integrity — two-layer SHA-1 verification
+### 4.3 Integrity — per-piece SHA-1 verification
 
-Layer 1 — **per piece, on receipt**: `hash_buffer()` (OpenSSL EVP SHA-1) is
-computed over the received bytes and compared against the publisher's
-manifest entry. Mismatches are rejected *before* any disk write and counted
-as a failed attempt:
-
-* after **5** failures (`MAX_PIECE_ATTEMPTS`) a piece is blacklisted
-  (`pieces_exhausted`), so one persistently corrupt or flaky peer cannot stall
-  a download forever — the coordinator simply never selects that piece again,
-  and if nothing else can serve it, the abort rule of 4.2 ends the download
-  with a clear diagnosis.
-
-Layer 2 — **whole file, at the end**: the completed file is re-hashed
-piece-by-piece (`compute_hashes`) and the concatenated digest is compared with
-the manifest. This catches any corruption path that could bypass layer 1
-(disk-level error after a "successful" write, parsing bug, offset math error).
-Only after layer 2 passes does the downloader announce the file and (via the
+`hash_buffer()` (OpenSSL EVP SHA-1) is computed over each received piece and
+compared against the publisher's manifest entry. A mismatch is rejected
+*before* any disk write: the piece is released for other peers, the offending
+peer loses its claim to that piece, and it is dropped after three consecutive
+bad pieces. Because every piece is verified before it is written and each is
+written exactly once, a download that collected all pieces needs no second
+whole-file pass. Only then does the downloader announce the file and (via the
 tracker) promote itself from leecher to seeder.
 
-The publisher pays a symmetric cost at upload time: `compute_hashes` reads the
-file incrementally (constant memory, regardless of file size) and registers
-`concatenated_hashes` with the tracker.
+The tracker protects the manifest itself: `upload_file` under an existing
+name is accepted only if size and hashes match the registered file, so a
+second seeder can never serve content that fails other leechers' checks.
+
+The publisher pays the hashing cost once at upload time: `compute_hashes`
+reads the file incrementally (constant memory, regardless of file size) and
+registers `concatenated_hashes` with the tracker.
 
 ### 4.4 Partial seeding — swarm acceleration
 
@@ -273,11 +276,10 @@ peer-server builds bitfields from live download state:
 
 ```cpp
 // client_peer.cpp (abridged)
-if (is_partial && download_state) {
-  for (bool have : download_state->pieces_we_have)   // true possession
-    bitfield += have ? '1' : '0';
-} else {
-  bitfield = std::string(num_pieces, '1');            // complete seeder
+std::string bitfield(num_pieces, '1');               // complete seeder
+if (file.download) {                                 // still downloading
+  for (i = 0; i < num_pieces; ++i)                   // true possession
+    if (!file.download->pieces_we_have[i]) bitfield[i] = '0';
 }
 ```
 
@@ -293,42 +295,50 @@ re-issues `upload_file` so the tracker's seeder set reflects reality.
 Two trackers, N = `tracker_info.txt` entries, replication listener on
 `client_port + 1000`:
 
-**Role election (each tick of `ReplicationManager::run`):**
+**Role election (`ReplicationManager::run_backup_mode`):**
+
+Only a primary accepts connections on the replication port, and it speaks
+first (the full state). Everyone else leaves connections in the listen
+backlog, so a caller hears silence.
 
 ```
 if N == 1:  become PRIMARY immediately            # no peer to elect with
-else:
-    connect to the OTHER tracker's replication port (2 s timeout,
-    non-blocking connect + select so a dead peer can't hang us)
-    connect succeeded → I am BACKUP   (someone else is primary)
-    connect refused   → I am PRIMARY   (no active primary out there)
+loop:
+    connect to the OTHER tracker's replication port (2 s timeout)
+    cannot connect            → PRIMARY   (nobody else is running)
+    first message arrives     → BACKUP    (follow that primary)
+    connected but silent 2 s:
+        I was following it    → PRIMARY   (it hung)
+        my id is lower        → PRIMARY   (both undecided: tie-break)
+        otherwise             → retry in 0.5 s
 ```
 
-This is a deliberate simplification: with exactly two trackers, "the other one
-isn't a functioning primary" and "there is no primary" coincide, so no voting
-quorum is needed. A split-brain is impossible because a tracker only assumes
-backup status by *observing* a live primary, and only claims primary status
-when it *cannot observe* one.
+A successful TCP connect alone proves nothing about the other tracker's role,
+which is why the decision waits for the first message. Two trackers started
+at the same instant therefore resolve to exactly one primary within about two
+seconds, instead of each mistaking the other for a primary.
 
 **State synchronization:**
 
-* On becoming backup, the primary streams `FULL_STATE_SYNC` — the entire
-  `TrackerState` serialized (`USER`, `GROUP`, `FILE …` records) — then flushes
-  its queue of commands that fired while the backup was down, then clears it.
-* While healthy, every mutating command is additionally forwarded verbatim
+* When a backup connects, the primary sends `FULL_STATE_SYNC` — the entire
+  `TrackerState` serialized (`USER`, `GROUP`, `FILE …` records). The snapshot
+  and the switch to live forwarding happen under one lock, so no command can
+  fall between them. A reconnecting backup replaces the previous connection.
+* While connected, every mutating command is forwarded verbatim
   (`forward_command`) and replayed by the backup via
-  `process_replicated_command`. The queue is capped at 1000 entries; overflow
-  forces reliance on the next full sync rather than unbounded memory.
+  `process_replicated_command`. Nothing is queued while no backup is
+  connected: the next full sync covers it.
+* Sessions (logins, peer addresses) are deliberately not replicated.
 * The primary sends `HEARTBEAT` every 2 s on the replication socket; a failed
-  send immediately demotes the link and re-enters the wait-for-backup state.
+  send drops the link until the backup reconnects.
 
-**Failover (backup side):** if `receiveMessage` from the primary ever fails,
-the backup promotes itself, **clears all client sessions** (login state is
-per-connection and cannot be safely preserved), rebinds the client-facing
-port, and serves new connections from its replicated state. Failover is
-bounded by the 2 s connect timeout / 2 s heartbeat rather than by TCP's
-default multi-minute blocking `connect()` — the backup's connect loop is
-explicitly interruptible by `should_stop`.
+**Failover (backup side):** if the connection to the primary drops, or no
+message arrives for 6 s (three heartbeats), the backup re-runs the election
+loop above. Only if the primary is unreachable or stays silent does it
+promote itself; it then starts with **no client sessions** (login state is
+per-connection and cannot be safely preserved) and serves new connections
+from its replicated state. A killed primary is replaced within a second; a
+hung one within about eight.
 
 Client side, the failover is mostly transparent: clients hold both tracker
 addresses and retry down the list at startup (`Trying next...`), and the
@@ -340,10 +350,10 @@ as needed.
 | Shared state | Protection |
 |---|---|
 | Download piece bookkeeping (`pieces_*`, `piece_rarity`) | `state_mutex` + condition variable |
-| Output file writes | `file_mutex` + `pwrite` at fixed offsets |
+| Output file writes | lock-free `pwrite` at fixed offsets, one writer per piece |
 | Console I/O | `cout_mutex` + redraw-above-prompt line discipline |
 | Login state | `std::atomic<bool>` |
-| Tracker state (users/groups/files) | `TrackerState` internal mutex; replication queue guarded separately |
+| Tracker state (users/groups/files) | `TrackerState` internal mutex; backup socket guarded by a separate replication mutex |
 | Piece assignment | single coordinator thread assigns; workers only clear their own slot |
 
 ---
@@ -366,11 +376,12 @@ as needed.
   random, selectable per download; unknown names fail safe to rarest-first.
 * **Per-peer I/O timeouts** (10 s) — a peer that accepts but never replies
   cannot wedge a worker; the piece returns to the selectable pool.
-* **Retry budget & blacklist** — 5 attempts per piece (4.3), plus the
-  no-progress abort rule (4.2), give every download a guaranteed termination
-  path: success, genuine completion, or a diagnosed impossibility.
-* **Atomic piece placement** — `pwrite` at `index × 512 KB` under
-  `file_mutex`; short writes are treated as failures.
+* **Bad-peer handling** — a failed piece is never requested from the same
+  peer again, three bad pieces in a row drop the peer (4.3), and workers exit
+  when nothing is servable (4.2), giving every download a guaranteed
+  termination path: completion or a diagnosed impossibility.
+* **Atomic piece placement** — `pwrite` at `index × 512 KB`; short writes are
+  treated as failures.
 * **Streaming-friendly mode** — `sequential` ordering for in-order playback
   use cases.
 
@@ -386,13 +397,13 @@ as needed.
   persistent history (`~/.p2p_client_history`, capped, deduplicated).
 * **Leveled logging** — ERROR/WARN always visible; debug chatter compiled out
   of release builds via `P2P_LOG_LEVEL`; all logs to stderr so stdout stays
-  clean when redirected. `make` (release, `-O2`, quiet) vs `make debug`
-  (`-g -O0` + full logging) build into separate object trees.
+  clean when redirected. `make` (debug, full logging) vs `make release`
+  (`-O2`, quiet) build into separate object trees.
 * **Persisted client state** — per-user seeded-file metadata on disk is
   reloaded at login; completed files are re-registered as shares.
 
 ### Testing (what "verified" concretely means)
-* **48 unit tests** (dependency-free framework, run under ASan + UBSan with
+* **46 unit tests** (dependency-free framework, run under ASan + UBSan with
   leak detection) over hashing, protocol framing, tracker state machine, and
   download logic.
 * **Integration harness** (`bash tests/integration_test.sh`) with real
@@ -411,13 +422,13 @@ as needed.
 | Idea | Mechanism in this codebase | Payoff |
 |---|---|---|
 | *Metadata ≠ data* | tracker stores hashes + peer lists only | tracker is tiny, replicable, never a bandwidth bottleneck |
-| *Verify everything* | per-piece SHA-1 + final whole-file digest | corruption from any source (network, disk, malicious peer) is caught |
+| *Verify everything* | per-piece SHA-1 before every write; tracker rejects mismatched manifests | corruption from any source (network, disk, malicious peer) is caught |
 | *Rarest-first scheduling* | `RarestFirstSelector` over live rarity counts | swarm health; protects data closest to extinction |
 | *Strategy pattern at the scheduling core* | `PieceSelector` interface + 3 implementations | algorithm comparison and per-download tuning without recompiling |
-| *Failure budgets* | `MAX_PIECE_ATTEMPTS`, exhaustion blacklist, no-progress abort | every download provably terminates; one bad peer can't stall the swarm |
+| *Failure budgets* | per-peer piece blacklist, three-strike peer drop, exit when nothing is servable | every download provably terminates; one bad peer can't stall the swarm |
 | *Possession-truthful bitfields* | partial-seeding bitfield from live `pieces_we_have` | leechers contribute immediately; aggregate throughput rises |
-| *Cheap quorum-free failover* | probe-based election for exactly two trackers | no consensus complexity; 2-second bounded failover |
-| *Command replication with sync fallback* | verbatim forwarding + queue + `FULL_STATE_SYNC` | backup converges without per-command durability requirements |
+| *Cheap quorum-free failover* | first-message election with id tie-break for exactly two trackers | no consensus complexity; bounded failover |
+| *Command replication with sync fallback* | verbatim forwarding + `FULL_STATE_SYNC` on every (re)connect | backup converges without per-command durability requirements |
 | *Framed TCP* | 4-byte length prefix everywhere | no partial-message bugs; binary payloads safe |
 | *Crash-safe persistence* | append-only history file; append metadata + reload at login | client state survives restarts without a database |
 
@@ -442,9 +453,12 @@ Honest notes on the current design, useful both as caveats and as a roadmap:
 6. **Hash algorithm is fixed to SHA-1** — fine for integrity (not for
    adversarial collision resistance); a SHA-256 path via the same EVP API is
    a small change.
-7. **Coordinator polling cadence** — the scheduler's 100 ms sleep adds a small
-   scheduling latency per assignment; an event-driven handoff from worker
-   completion to coordinator would shave it.
+7. **Bitfields are a handshake-time snapshot** — a leecher's bitfield is read
+   once, so pieces it acquires later are not requested from it by peers that
+   connected earlier. `HAVE` announcements would fix this.
+8. **A resumed hung primary is not demoted** — if a primary stalls long enough
+   for the backup to take over and then resumes, both believe they are
+   primary. A lease or epoch number would close this.
 
 ---
 

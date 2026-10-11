@@ -34,11 +34,15 @@ The system is composed of two primary components:
 * **Partial Seeding:** A client can begin uploading pieces it has already downloaded to other peers, even before its own download is 100% complete.
 * **File Integrity:** All files and file pieces are verified using **SHA1 hashes** to ensure data is not corrupted during transfer.
 * **Robust Concurrency:** The system is heavily multi-threaded and uses thread-safe data structures and synchronization primitives (`std::mutex`, `std::condition_variable`) to handle concurrent operations safely and efficiently.
-* **Tested:** A dependency-free unit test suite (46 tests, runs under AddressSanitizer + UBSan) plus an end-to-end integration harness covering real transfers, tracker failover, and corrupt-peer resilience. See [Testing](#9-testing).
+* **Tested:** A dependency-free unit test suite (46 tests, runs under AddressSanitizer + UBSan) plus an end-to-end integration harness covering real transfers, tracker failover, and corrupt-peer resilience. See [Testing](#7-testing).
 
 ---
 
 ## 3. Compilation and Execution
+
+### Prerequisites
+* Linux (or WSL) with `g++` supporting C++17, and `make`.
+* The OpenSSL development library for SHA1 (`libssl-dev` on Debian/Ubuntu); the binaries link against `-lcrypto` and `-lpthread`.
 
 ### Compilation
 The project uses a standard Makefile with two build modes:
@@ -58,6 +62,20 @@ events always print; per-command `DEBUG` chatter is compiled out of release
 builds (via the `P2P_LOG_LEVEL` macro) and only enabled by `make debug`.
 Log messages go to stderr, so normal command output on stdout stays clean
 when redirecting.
+
+### Tracker Info File
+Trackers and clients both read a tracker info file, conventionally named
+`tracker_info.txt`. It is not part of the repository, so create it first. It
+holds one tracker address per line, as `IP:PORT`:
+
+```
+127.0.0.1:5000
+127.0.0.1:5001
+```
+
+The tracker's second argument is its 1-based line number in this file. Each
+tracker also listens for its peer tracker on **its port + 1000** (6000 and
+6001 above), so keep those ports free as well.
 
 ### Execution
 The system requires at least one tracker and one client to be running. For a fault-tolerant setup, run both trackers.
@@ -95,6 +113,30 @@ prompt (dim `anon@p2p` until you log in), with full line editing:
 Malformed commands, unknown commands, and tracker errors are reported in red
 without ever crashing the client or corrupting the input line.
 
+### Client Commands
+
+| Command | Description |
+|---|---|
+| `create_user <user_id> <password>` | Register a new user |
+| `login <user_id> <password>` | Start a session |
+| `logout` | End the current session |
+| `create_group <group_id>` | Create a group; you become its owner |
+| `join_group <group_id>` | Request to join a group |
+| `leave_group <group_id>` | Leave a group |
+| `list_groups` | List all groups in the network |
+| `list_requests <group_id>` | List pending join requests |
+| `accept_request <group_id> <user_id>` | Approve a pending join request |
+| `list_files <group_id>` | List the files shared in a group |
+| `upload_file <group_id> <file_path>` | Share a file with a group |
+| `download_file <group_id> <file_name> <dest_path> [rarest\|sequential\|random]` | Download a file; `dest_path` may be a file path or a directory |
+| `stop_share <group_id> <file_name>` | Stop sharing a file |
+| `show_downloads` | List downloads: `[D]` in progress (with piece count), `[C]` completed, `[E]` failed |
+| `clear` / `cls` | Clear the screen |
+| `help` / `?` | Show the command list |
+| `quit` / `exit` | Exit the client |
+
+Before you log in, only `create_user`, `login` and the local commands (`clear`, `help`, `quit`) work.
+
 ---
 
 ## 4. System Design and Implementation
@@ -105,7 +147,7 @@ without ever crashing the client or corrupting the input line.
 To achieve fault tolerance, a Primary-Backup model was implemented:
 1.  **Role Election:** On startup, each tracker connects to the other on a dedicated replication port. Only a Primary accepts that connection, and it answers at once with a full copy of its state. A tracker that cannot connect assumes the **Primary** role; one that receives the state becomes the **Backup**. If both start together, each hears only silence from the other, and the lower-numbered tracker takes the Primary role while the other retries.
 2.  **State Replication:** The Primary handles all client interactions. A Backup receives the full state when it connects. After that, for any state-changing command (e.g., `create_user`), the Primary forwards the command string to the Backup, which applies the same change to its in-memory state. Login sessions and peer addresses are not replicated.
-3.  **Failover:** The Primary sends a heartbeat every 2 seconds. If the Backup loses its connection, or hears nothing for 6 seconds, it tries to reconnect; if the Primary is unreachable or stays silent, the Backup promotes itself and begins accepting client connections. A newly promoted Primary starts with no user sessions, forcing clients to re-login to ensure a consistent state.
+3.  **Failover:** The Primary sends a heartbeat every 2 seconds. If the Backup loses its connection, or hears nothing for 6 seconds, it tries to reconnect; if the Primary is unreachable or stays silent, the Backup promotes itself and begins accepting client connections. A newly promoted Primary starts with no user sessions. A client that loses its tracker connection exits with a message; restart it and log in again to reach the new Primary.
 
 #### Data Structures
 * `std::unordered_map` is used for primary data containers (`users`, `groups`, `files`) for its efficient average-case O(1) time complexity for lookups.
@@ -151,17 +193,29 @@ The system's true power comes from the synergy between two features:
 All communication occurs over TCP sockets using a custom, length-prefixed protocol to ensure reliable message framing. A 4-byte header indicates the length of the upcoming message payload.
 
 ### Client-Tracker Protocol
+On connect, the tracker first announces its role: `ROLE PRIMARY`, or
+`ROLE BACKUP` followed by closing the connection. The client tries each
+address in the tracker info file until it finds the Primary.
+
 * `create_user <user_id> <password>`
-* `login <user_id> <password> <peer_port>`
+* `login <user_id> <password> <peer_port>` (the client appends its own peer port)
+* `logout`
 * `create_group <group_id>`
 * `join_group <group_id>`
+* `leave_group <group_id>`
+* `accept_request <group_id> <user_id>`
+* `list_groups`
+* `list_requests <group_id>`
 * `list_files <group_id>`
 * `upload_file <group_id> <file_name> <size> <hashes>`
+* `stop_share <group_id> <file_name>`
 * `download_file <group_id> <file_name>`
+* `start_downloading <group_id> <file_name>` (sent by the client when a download begins)
+* `stop_leeching <group_id> <file_name>` (sent when a download fails, or the client exits with one unfinished)
 * **Response Format:** `SUCCESS: <message>` or `ERROR: <message>`
 
 ### Client-Peer Protocol
-* `HANDSHAKE <group_id> <file_name>`
+* `HANDSHAKE <group_id> <file_name>`, answered with `HANDSHAKE_OK` or `HANDSHAKE_FAIL: <reason>`
 * `BITFIELD <011010...>`
 * `REQUEST_PIECE <piece_index>`
 * `PIECE <piece_index> <binary_data>`
@@ -218,7 +272,7 @@ processes on exit. Run it with `--keep` to preserve logs under
 ### Limitations
 * **Tracker State is Ephemeral:** As per the design, if both trackers shut down simultaneously, all user, group, and file metadata is lost. The system is highly available but not persistent on the tracker side.
 * **Seeding is Path-Dependent:** As hardlinks were removed for simplicity, seeding relies on the original file remaining at its absolute path. If the user moves, renames, or deletes the file, seeding will break.
-* **Peer Addresses Are Session State:** Peer addresses are not replicated to the backup; on failover all sessions are invalidated and clients must re-login (which re-publishes their addresses to the new primary).
+* **Peer Addresses Are Session State:** Peer addresses are not replicated to the backup; on failover all sessions are invalidated, and clients must be restarted and log in again (which re-publishes their addresses to the new primary).
 
 ---
 
